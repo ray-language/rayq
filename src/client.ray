@@ -1,0 +1,193 @@
+// rayq — CLI client verbs over the RPC connection, plus the worker loop.
+import std/time;
+import std/json;
+from std/json import Json;
+import rpc/rpc;
+import std/process;
+
+fn params1(k: string, v: string) -> Json {
+    var m: Map<string, Json> = Map.new();
+    m.insert(k, Json.JStr(v));
+    Json.JObject(m)
+}
+
+fn params2(k1: string, v1: string, k2: string, v2: string) -> Json {
+    var m: Map<string, Json> = Map.new();
+    m.insert(k1, Json.JStr(v1));
+    m.insert(k2, Json.JStr(v2));
+    Json.JObject(m)
+}
+
+fn with_client(host: string, port: int, f: fn(rpc.Client) -> int) -> int {
+    match (rpc.connect(host, port)) {
+        Result.Err(e) => {
+            eprint("rayq: connect failed: " + e);
+            1
+        },
+        Result.Ok(c) => {
+            let code = f(c);
+            rpc.disconnect(c);
+            code
+        },
+    }
+}
+
+pub fn push(host: string, port: int, q: string, body: string) -> int {
+    with_client(host, port, fn(c: rpc.Client) -> int {
+        match (rpc.call(c, "push", params2("queue", q, "body", body))) {
+            Result.Ok(j) => {
+                match (json.get_string(j, "id")) {
+                    Option.Some(id) => print(id),
+                    Option.None => print(json.stringify(j)),
+                }
+                0
+            },
+            Result.Err(e) => {
+                eprint("rayq: " + e);
+                1
+            },
+        }
+    })
+}
+
+// Polls until a message arrives or wait_ms runs out (0 = one shot). Prints
+// "id<TAB>attempt<TAB>body"; --ack acknowledges right away (at-most-once!).
+pub fn pull(host: string, port: int, q: string, wait_ms: int, auto_ack: bool) -> int {
+    with_client(host, port, fn(c: rpc.Client) -> int {
+        let deadline = time.monotonic() + wait_ms;
+        while (true) {
+            match (rpc.call(c, "pull", params1("queue", q))) {
+                Result.Err(e) => {
+                    eprint("rayq: " + e);
+                    return 1;
+                },
+                Result.Ok(j) => {
+                    if (!json.is_null(j)) {
+                        let id = match (json.get_string(j, "id")) {
+                            Option.Some(s) => s,
+                            Option.None => "",
+                        };
+                        let body = match (json.get_string(j, "body")) {
+                            Option.Some(s) => s,
+                            Option.None => "",
+                        };
+                        let attempt = match (json.get_int(j, "attempt")) {
+                            Option.Some(n) => n,
+                            Option.None => 0,
+                        };
+                        print(id + "\t" + to_string(attempt) + "\t" + body);
+                        if (auto_ack) {
+                            rpc.call(c, "ack", params2("queue", q, "id", id));
+                        }
+                        return 0;
+                    }
+                    if (time.monotonic() >= deadline) {
+                        eprint("rayq: queue '" + q + "' is empty");
+                        return 2;
+                    }
+                    time.sleep(200);
+                },
+            }
+        }
+        0
+    })
+}
+
+pub fn simple(host: string, port: int, method: string, q: string, id: string) -> int {
+    with_client(host, port, fn(c: rpc.Client) -> int {
+        let params = if (id == "") { params1("queue", q) } else {
+            params2("queue", q, "id", id)
+        };
+        match (rpc.call(c, method, params)) {
+            Result.Ok(j) => {
+                print(json.stringify(j));
+                0
+            },
+            Result.Err(e) => {
+                eprint("rayq: " + e);
+                1
+            },
+        }
+    })
+}
+
+pub fn stats(host: string, port: int, q: string) -> int {
+    with_client(host, port, fn(c: rpc.Client) -> int {
+        var m: Map<string, Json> = Map.new();
+        if (q != "") {
+            m.insert("queue", Json.JStr(q));
+        }
+        match (rpc.call(c, "stats", Json.JObject(m))) {
+            Result.Ok(j) => {
+                print(json.stringify_pretty(j, 2));
+                0
+            },
+            Result.Err(e) => {
+                eprint("rayq: " + e);
+                1
+            },
+        }
+    })
+}
+
+// The consumer loop: one OS command per message — the body goes to the
+// child's stdin, exit 0 acks, anything else nacks (backoff + DLQ upstream).
+pub fn worker(host: string, port: int, q: string, argv: [string]) -> int {
+    if (argv.len() == 0) {
+        eprint("rayq: worker needs a command after --");
+        return 1;
+    }
+    with_client(host, port, fn(c: rpc.Client) -> int {
+        eprint("worker on '" + q + "': " + join(argv, " "));
+        while (true) {
+            match (rpc.call(c, "pull", params1("queue", q))) {
+                Result.Err(e) => {
+                    eprint("rayq: " + e);
+                    return 1;
+                },
+                Result.Ok(j) => {
+                    if (json.is_null(j)) {
+                        time.sleep(300);
+                    } else {
+                        let id = match (json.get_string(j, "id")) {
+                            Option.Some(s) => s,
+                            Option.None => "",
+                        };
+                        let body = match (json.get_string(j, "body")) {
+                            Option.Some(s) => s,
+                            Option.None => "",
+                        };
+                        var rest: [string] = [];
+                        var i = 1;
+                        while (i < argv.len()) {
+                            rest.push(argv[i]);
+                            i = i + 1;
+                        }
+                        let ran = process.cmd(argv[0], rest).stdin(body.to_bytes()).run();
+                        var ok = false;
+                        match (ran) {
+                            Result.Ok(out) => {
+                                match (out.exit) {
+                                    process.Exit.Code(code) => {
+                                        ok = code == 0;
+                                    },
+                                    process.Exit.Signal(sig) => {
+                                        ok = false;
+                                    },
+                                }
+                            },
+                            Result.Err(e) => {
+                                eprint("rayq: could not launch: " + e);
+                                ok = false;
+                            },
+                        }
+                        let verb = if (ok) { "ack" } else { "nack" };
+                        rpc.call(c, verb, params2("queue", q, "id", id));
+                        eprint(verb + " " + id);
+                    }
+                },
+            }
+        }
+        0
+    })
+}

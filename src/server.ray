@@ -1,0 +1,77 @@
+// rayq — the RPC surface over the broker actor (packages/rpc, JSON params).
+//
+// Methods: push {queue, body} → {id} · pull {queue} → {id, body, attempt} |
+// null · ack/nack {queue, id} · stats {queue?}. A broker-level "error" field
+// becomes an RPC err so clients get Result semantics end to end.
+import std/json;
+from std/json import Json;
+import rpc/rpc;
+import broker;
+
+fn param_str(req: rpc.Req, key: string) -> Result<string, string> {
+    match (json.get_string(req.params, key)) {
+        Option.Some(s) => {
+            if (s == "") {
+                return Result.Err("param '" + key + "' is empty");
+            }
+            Result.Ok(s)
+        },
+        Option.None => Result.Err("missing param '" + key + "'"),
+    }
+}
+
+fn reply_or_err(j: Json) -> Result<Json, string> {
+    match (json.get_string(j, "error")) {
+        Option.Some(e) => Result.Err(e),
+        Option.None => Result.Ok(j),
+    }
+}
+
+pub fn handle(bk: Channel<broker.Bk>, req: rpc.Req) -> Result<Json, string> {
+    if (req.method == "push") {
+        let q = param_str(req, "queue")?;
+        let body = match (json.get_string(req.params, "body")) {
+            Option.Some(s) => s,
+            Option.None => {
+                return Result.Err("missing param 'body'");
+            },
+        };
+        reply_or_err(broker.ask(bk, fn(reply: Channel<Json>) -> broker.Bk {
+            broker.Bk.Push(q, body, reply)
+        }))
+    } else if (req.method == "pull") {
+        let q = param_str(req, "queue")?;
+        reply_or_err(broker.ask(bk, fn(reply: Channel<Json>) -> broker.Bk {
+            broker.Bk.Pull(q, reply)
+        }))
+    } else if (req.method == "ack") {
+        let q = param_str(req, "queue")?;
+        let id = param_str(req, "id")?;
+        reply_or_err(broker.ask(bk, fn(reply: Channel<Json>) -> broker.Bk {
+            broker.Bk.Ack(q, id, reply)
+        }))
+    } else if (req.method == "nack") {
+        let q = param_str(req, "queue")?;
+        let id = param_str(req, "id")?;
+        reply_or_err(broker.ask(bk, fn(reply: Channel<Json>) -> broker.Bk {
+            broker.Bk.Nack(q, id, reply)
+        }))
+    } else if (req.method == "stats") {
+        let q = match (json.get_string(req.params, "queue")) {
+            Option.Some(s) => s,
+            Option.None => "",
+        };
+        reply_or_err(broker.ask(bk, fn(reply: Channel<Json>) -> broker.Bk {
+            broker.Bk.Stats(q, reply)
+        }))
+    } else {
+        Result.Err("unknown method: " + req.method)
+    }
+}
+
+// Blocks until SIGTERM/SIGINT (graceful drain via packages/rpc).
+pub fn run(bind: string, port: int, bk: Channel<broker.Bk>, drain_ms: int) -> Result<int, string> {
+    rpc.serve_graceful(bind, port, drain_ms, fn(req: rpc.Req) -> Result<Json, string> {
+        handle(bk, req)
+    })
+}

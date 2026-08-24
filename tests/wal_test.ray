@@ -1,0 +1,102 @@
+// WAL: append/replay round trip, torn-tail tolerance, compaction via rename.
+import std/fs;
+import wal;
+
+const DIR: string = "/tmp/rayq_wal_test";
+
+fn reset() -> string {
+    if (fs.exists(DIR)) {
+        match (fs.list_dir(DIR)) {
+            Result.Ok(names) => {
+                for f in names {
+                    fs.remove_file(DIR + "/" + f);
+                }
+            },
+            Result.Err(e) => { },
+        }
+    } else {
+        fs.mkdir(DIR);
+    }
+    DIR + "/q.log"
+}
+
+fn must_open(path: string) -> wal.Wal {
+    match (wal.open_wal(path)) {
+        Result.Ok(w) => w,
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn append_and_replay_round_trip() {
+    let path = reset();
+    let w = must_open(path);
+    wal.append(w, wal.push_record("01-aaa", "hola \"json\"", 0));
+    wal.append(w, wal.push_record("01-bbb", "dos", 2));
+    wal.append(w, wal.ack_record("01-aaa"));
+    wal.append(w, wal.nack_record("01-bbb"));
+    wal.close_wal(w);
+    let rep = wal.replay(path);
+    assert_eq(rep.torn, 0);
+    assert_eq(rep.records.len(), 4);
+    assert_eq(rep.records[0].op, "push");
+    assert_eq(rep.records[0].body, "hola \"json\"");
+    assert_eq(rep.records[1].attempt, 2);
+    assert_eq(rep.records[2].op, "ack");
+    assert_eq(rep.records[3].op, "nack");
+    assert_eq(rep.records[3].id, "01-bbb");
+}
+
+@test
+fn torn_tail_is_discarded_not_fatal() {
+    let path = reset();
+    let w = must_open(path);
+    wal.append(w, wal.push_record("01-aaa", "entera", 0));
+    wal.close_wal(w);
+    // Simulate a crash mid-append: a record without its newline.
+    fs.append_file(path, "{\"op\":\"push\",\"id\":\"01-bbb\",\"bo");
+    let rep = wal.replay(path);
+    assert_eq(rep.records.len(), 1);
+    assert_eq(rep.records[0].id, "01-aaa");
+    assert_eq(rep.torn, 1);
+}
+
+@test
+fn corrupt_middle_line_is_skipped() {
+    let path = reset();
+    let w = must_open(path);
+    wal.append(w, wal.push_record("01-aaa", "una", 0));
+    wal.close_wal(w);
+    fs.append_file(path, "no es json\n");
+    let w2 = must_open(path);
+    wal.append(w2, wal.push_record("01-ccc", "tres", 0));
+    wal.close_wal(w2);
+    let rep = wal.replay(path);
+    assert_eq(rep.records.len(), 2);
+    assert_eq(rep.torn, 1);
+    assert_eq(rep.records[1].id, "01-ccc");
+}
+
+@test
+fn compact_keeps_only_pending_and_reopens() {
+    let path = reset();
+    var w = must_open(path);
+    wal.append(w, wal.push_record("01-aaa", "va", 0));
+    wal.append(w, wal.push_record("01-bbb", "queda", 3));
+    wal.append(w, wal.ack_record("01-aaa"));
+    var pend: [wal.Record] = [];
+    pend.push(wal.push_record("01-bbb", "queda", 3));
+    let fresh = match (wal.compact(w, pend)) {
+        Result.Ok(x) => x,
+        Result.Err(e) => panic(e),
+    };
+    // The handle survives compaction: appends land in the NEW file.
+    wal.append(fresh, wal.ack_record("01-bbb"));
+    wal.close_wal(fresh);
+    let rep = wal.replay(path);
+    assert_eq(rep.records.len(), 2);
+    assert_eq(rep.records[0].id, "01-bbb");
+    assert_eq(rep.records[0].attempt, 3);
+    assert_eq(rep.records[1].op, "ack");
+    assert(!fs.exists(path + ".tmp"));
+}

@@ -1,0 +1,5 @@
+# dependencies downloaded by the package manager
+.ray-deps/
+rayq
+rayq-data/
+*.log

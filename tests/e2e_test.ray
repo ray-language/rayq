@@ -1,0 +1,157 @@
+// End-to-end over real RPC: push/pull/ack, nack → backoff → DLQ, stats, and
+// the durability story (a second broker over the same dir sees exactly the
+// unacked messages). One @test: the runner leaves zombie listeners between
+// tests (see raygate), so servers boot once.
+import std/fs;
+import std/time;
+import std/json;
+from std/json import Json;
+import rpc/rpc;
+import queue;
+import broker;
+import server;
+
+const DIR: string = "/tmp/rayq_e2e_data";
+
+const PORT_A: int = 18951;
+
+const PORT_B: int = 18952;
+
+fn wipe() {
+    if (fs.exists(DIR)) {
+        match (fs.list_dir(DIR)) {
+            Result.Ok(names) => {
+                for f in names {
+                    fs.remove_file(DIR + "/" + f);
+                }
+            },
+            Result.Err(e) => { },
+        }
+    }
+}
+
+fn tuning() -> queue.Tuning {
+    queue.Tuning {
+        visibility_ms: 60000,
+        max_attempts: 2,
+        backoff_base_ms: 100,
+        backoff_max_ms: 200
+    }
+}
+
+fn boot(port: int) -> Channel<broker.Bk> {
+    let bk = match (broker.start(DIR, tuning())) {
+        Result.Ok(b) => b,
+        Result.Err(e) => panic(e),
+    };
+    spawn(fn() {
+        server.run("127.0.0.1", port, bk, 0);
+    });
+    time.sleep(150);
+    bk
+}
+
+fn connect(port: int) -> rpc.Client {
+    match (rpc.connect("127.0.0.1", port)) {
+        Result.Ok(c) => c,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn params(pairs: [(string, string)]) -> Json {
+    var m: Map<string, Json> = Map.new();
+    for (k, v) in pairs.iter() {
+        m.insert(k, Json.JStr(v));
+    }
+    Json.JObject(m)
+}
+
+fn call_ok(c: rpc.Client, method: string, p: Json) -> Json {
+    match (rpc.call(c, method, p)) {
+        Result.Ok(j) => j,
+        Result.Err(e) => panic(method + ": " + e),
+    }
+}
+
+fn str_of(j: Json, k: string) -> string {
+    match (json.get_string(j, k)) {
+        Option.Some(s) => s,
+        Option.None => panic("missing '" + k + "' in " + json.stringify(j)),
+    }
+}
+
+fn int_of(j: Json, k: string) -> int {
+    match (json.get_int(j, k)) {
+        Option.Some(n) => n,
+        Option.None => panic("missing '" + k + "' in " + json.stringify(j)),
+    }
+}
+
+@test
+fn broker_end_to_end() {
+    wipe();
+    let bk = boot(PORT_A);
+    let c = connect(PORT_A);
+
+    // push/pull/ack round trip.
+    let id1 = str_of(call_ok(c, "push", params([("queue", "jobs"), ("body", "uno")])), "id");
+    let id2 = str_of(call_ok(c, "push", params([("queue", "jobs"), ("body", "dos")])), "id");
+    let m1 = call_ok(c, "pull", params([("queue", "jobs")]));
+    assert_eq(str_of(m1, "id"), id1);
+    assert_eq(str_of(m1, "body"), "uno");
+    assert_eq(int_of(m1, "attempt"), 1);
+    call_ok(c, "ack", params([("queue", "jobs"), ("id", id1)]));
+
+    // Unknown ack is an RPC error, not a silent success.
+    match (rpc.call(c, "ack", params([("queue", "jobs"), ("id", "nope")]))) {
+        Result.Err(e) => assert(e.contains("unknown")),
+        Result.Ok(j) => panic("expected err for unknown ack"),
+    }
+
+    // nack → delayed retry → redelivered with attempt 2 → nack again → DLQ
+    // (max_attempts = 2).
+    let m2 = call_ok(c, "pull", params([("queue", "jobs")]));
+    assert_eq(str_of(m2, "id"), id2);
+    let r1 = call_ok(c, "nack", params([("queue", "jobs"), ("id", id2)]));
+    assert_eq(int_of(r1, "retry_in_ms"), 100);
+    // Not ready yet…
+    assert(json.is_null(call_ok(c, "pull", params([("queue", "jobs")]))));
+    time.sleep(350);
+    let m2b = call_ok(c, "pull", params([("queue", "jobs")]));
+    assert_eq(int_of(m2b, "attempt"), 2);
+    let r2 = call_ok(c, "nack", params([("queue", "jobs"), ("id", id2)]));
+    match (json.get_bool(r2, "dead_lettered")) {
+        Option.Some(b) => assert(b),
+        Option.None => panic("expected dead_lettered: " + json.stringify(r2)),
+    }
+    let dead = call_ok(c, "pull", params([("queue", "jobs.dlq")]));
+    assert_eq(str_of(dead, "id"), id2);
+    assert_eq(str_of(dead, "body"), "dos");
+
+    // stats reflect it all.
+    let st = call_ok(c, "stats", params([("queue", "jobs")]));
+    assert_eq(int_of(st, "pushed"), 2);
+    assert_eq(int_of(st, "acked"), 1);
+    assert_eq(int_of(st, "dead"), 1);
+    assert_eq(int_of(st, "ready"), 0);
+
+    // Durability: push two more, ack one, leave one in flight; a SECOND
+    // broker over the same dir must offer exactly the unacked ones.
+    let id3 = str_of(call_ok(c, "push", params([("queue", "jobs"), ("body", "tres")])), "id");
+    let id4 = str_of(call_ok(c, "push", params([("queue", "jobs"), ("body", "cuatro")])), "id");
+    let m3 = call_ok(c, "pull", params([("queue", "jobs")]));
+    call_ok(c, "ack", params([("queue", "jobs"), ("id", str_of(m3, "id"))]));
+    call_ok(c, "pull", params([("queue", "jobs")]));
+    rpc.disconnect(c);
+
+    boot(PORT_B);
+    let c2 = connect(PORT_B);
+    let s1 = call_ok(c2, "pull", params([("queue", "jobs")]));
+    assert_eq(str_of(s1, "id"), id4);
+    assert_eq(str_of(s1, "body"), "cuatro");
+    assert(json.is_null(call_ok(c2, "pull", params([("queue", "jobs")]))));
+    // The dead-lettered message also survived, in its own queue.
+    let s2 = call_ok(c2, "pull", params([("queue", "jobs.dlq")]));
+    assert_eq(str_of(s2, "id"), id2);
+    rpc.disconnect(c2);
+}

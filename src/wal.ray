@@ -1,0 +1,158 @@
+// rayq — the write-ahead log: one append-only file per queue.
+//
+// Records are one JSON object per line: {"op":"push","id":…,"body":…,"attempt":n}
+// | {"op":"ack","id":…} | {"op":"nack","id":…}. Text framing on purpose: a
+// crash mid-append leaves a torn LAST line, and replay just discards any line
+// without a trailing newline or that fails to parse — that torn tail is the
+// whole recovery story.
+//
+// DURABILITY CAVEAT (recorded finding): std/fs has no fsync/flush, so an
+// append is only as durable as the OS page cache — safe across a process
+// crash, NOT across power loss. A real broker needs fs.sync(h).
+import std/fs;
+import std/json;
+from std/json import Json;
+
+pub struct Record {
+    op: string,
+    id: string,
+    body: string,
+    attempt: int,
+}
+
+pub struct Wal {
+    path: string,
+    handle: int,
+    records: int,
+    acked_since_compact: int,
+}
+
+fn encode(r: Record) -> string {
+    var m: Map<string, Json> = Map.new();
+    m.insert("op", Json.JStr(r.op));
+    m.insert("id", Json.JStr(r.id));
+    if (r.op == "push") {
+        m.insert("body", Json.JStr(r.body));
+        if (r.attempt > 0) {
+            m.insert("attempt", Json.JNum(r.attempt as float));
+        }
+    }
+    json.stringify(Json.JObject(m))
+}
+
+fn decode(line: string) -> Option<Record> {
+    match (json.parse(line)) {
+        Result.Ok(j) => {
+            let op = match (json.get_string(j, "op")) {
+                Option.Some(s) => s,
+                Option.None => "",
+            };
+            let id = match (json.get_string(j, "id")) {
+                Option.Some(s) => s,
+                Option.None => "",
+            };
+            if (op == "" || id == "") {
+                return Option.None;
+            }
+            let body = match (json.get_string(j, "body")) {
+                Option.Some(s) => s,
+                Option.None => "",
+            };
+            let attempt = match (json.get_int(j, "attempt")) {
+                Option.Some(n) => n,
+                Option.None => 0,
+            };
+            Option.Some(Record { op: op, id: id, body: body, attempt: attempt })
+        },
+        Result.Err(e) => Option.None,
+    }
+}
+
+pub fn open_wal(path: string) -> Result<Wal, string> {
+    let h = fs.open(path, "a")?;
+    Result.Ok(Wal { path: path, handle: h, records: 0, acked_since_compact: 0 })
+}
+
+pub fn append(w: Wal, r: Record) -> Result<int, string> {
+    let n = fs.write(w.handle, encode(r) + "\n")?;
+    w.records = w.records + 1;
+    if (r.op == "ack") {
+        w.acked_since_compact = w.acked_since_compact + 1;
+    }
+    Result.Ok(n)
+}
+
+pub fn close_wal(w: Wal) {
+    close(w.handle);
+}
+
+// Replays a log file into records, in order. A torn or corrupt line is
+// SKIPPED (its count is reported so the caller can log it), and a missing
+// file is just an empty log.
+pub struct Replayed {
+    records: [Record],
+    torn: int,
+}
+
+pub fn replay(path: string) -> Replayed {
+    var out: [Record] = [];
+    var torn = 0;
+    if (!fs.exists(path)) {
+        return Replayed { records: out, torn: 0 };
+    }
+    match (fs.read_file(path)) {
+        Result.Err(e) => Replayed { records: out, torn: 0 },
+        Result.Ok(content) => {
+            let lines = content.split("\n");
+            var i = 0;
+            while (i < lines.len()) {
+                let line = lines[i];
+                // The chunk after the last '\n' is either "" (clean tail) or a
+                // torn append: never replay it.
+                let is_tail = i == lines.len() - 1;
+                if (line.trim() != "" && !is_tail) {
+                    match (decode(line)) {
+                        Option.Some(r) => {
+                            out.push(r);
+                        },
+                        Option.None => {
+                            torn = torn + 1;
+                        },
+                    }
+                } else if (line.trim() != "" && is_tail) {
+                    torn = torn + 1;
+                }
+                i = i + 1;
+            }
+            Replayed { records: out, torn: torn }
+        },
+    }
+}
+
+// Rewrites the log to just the surviving pushes (with their attempt counts)
+// and atomically renames it over the old one. The open append handle points
+// at the OLD inode, so the caller must reopen: compact returns the fresh Wal.
+pub fn compact(w: Wal, pending: [Record]) -> Result<Wal, string> {
+    let tmp = w.path + ".tmp";
+    var content = "";
+    for r in pending {
+        content = content + encode(r) + "\n";
+    }
+    fs.write_file(tmp, content)?;
+    close(w.handle);
+    fs.rename(tmp, w.path)?;
+    let h = fs.open(w.path, "a")?;
+    Result.Ok(Wal { path: w.path, handle: h, records: pending.len(), acked_since_compact: 0 })
+}
+
+pub fn push_record(id: string, body: string, attempt: int) -> Record {
+    Record { op: "push", id: id, body: body, attempt: attempt }
+}
+
+pub fn ack_record(id: string) -> Record {
+    Record { op: "ack", id: id, body: "", attempt: 0 }
+}
+
+pub fn nack_record(id: string) -> Record {
+    Record { op: "nack", id: id, body: "", attempt: 0 }
+}

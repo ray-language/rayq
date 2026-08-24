@@ -1,0 +1,338 @@
+// rayq — the broker actor: sole owner of every queue's state and WAL handle.
+//
+// Startup replays each `<dir>/<queue>.log`, compacts it (pending-only), and
+// keeps an open append handle. Every mutation appends its record BEFORE the
+// in-memory state changes (write-ahead); a periodic Tick drives redeliveries
+// and delayed retries. Dead-lettered messages are re-routed to `<queue>.dlq`
+// as ack-in-source + push-in-dlq.
+import std/fs;
+import std/time;
+import std/uuid;
+import std/json;
+from std/json import Json;
+import wal;
+import queue;
+
+const TICK_MS: int = 100;
+
+const COMPACT_AFTER_ACKS: int = 1000;
+
+pub enum Bk {
+    Push(string, string, Channel<Json>),
+    Pull(string, Channel<Json>),
+    Ack(string, string, Channel<Json>),
+    Nack(string, string, Channel<Json>),
+    Stats(string, Channel<Json>),
+    Tick,
+}
+
+struct Entry {
+    state: queue.QueueState,
+    log: wal.Wal,
+}
+
+struct Broker {
+    dir: string,
+    tuning: queue.Tuning,
+    queues: Map<string, Entry>,
+    torn_total: int,
+}
+
+pub fn start(dir: string, tuning: queue.Tuning) -> Result<Channel<Bk>, string> {
+    if (!fs.exists(dir)) {
+        fs.mkdir(dir)?;
+    }
+    let ch: Channel<Bk> = Channel.bounded(256);
+    let b = load(dir, tuning)?;
+    spawn(fn() {
+        actor_loop(ch, b);
+    });
+    spawn(fn() {
+        while (true) {
+            time.sleep(TICK_MS);
+            send(ch, Bk.Tick);
+        }
+    });
+    Result.Ok(ch)
+}
+
+fn queue_path(dir: string, name: string) -> string {
+    dir + "/" + name + ".log"
+}
+
+// Replay + compact one queue log into a live Entry.
+fn load_queue(dir: string, name: string) -> Result<Entry, string> {
+    let path = queue_path(dir, name);
+    let rep = wal.replay(path);
+    var state = queue.new_queue();
+    var bodies: Map<string, string> = Map.new();
+    var attempts: Map<string, int> = Map.new();
+    for r in rep.records {
+        if (r.op == "push") {
+            bodies.insert(r.id, r.body);
+            attempts.insert(r.id, r.attempt);
+        } else if (r.op == "ack") {
+            bodies.remove(r.id);
+            attempts.remove(r.id);
+        } else if (r.op == "nack") {
+            match (get(attempts, r.id)) {
+                Option.Some(n) => {
+                    attempts.insert(r.id, n + 1);
+                },
+                Option.None => { },
+            }
+        }
+    }
+    // ids come out of a Map (sorted by key): uuid_v7 ids are time-ordered, so
+    // FIFO order survives the round trip through the Map.
+    for id in bodies.keys() {
+        let body = match (get(bodies, id)) {
+            Option.Some(s) => s,
+            Option.None => "",
+        };
+        let attempt = match (get(attempts, id)) {
+            Option.Some(n) => n,
+            Option.None => 0,
+        };
+        queue.enqueue(state, id, body, attempt);
+    }
+    var pend: [wal.Record] = [];
+    for m in queue.pending(state) {
+        pend.push(wal.push_record(m.id, m.body, m.attempt));
+    }
+    let fresh = wal.open_wal(path)?;
+    let compacted = wal.compact(fresh, pend)?;
+    Result.Ok(Entry { state: state, log: compacted })
+}
+
+fn load(dir: string, tuning: queue.Tuning) -> Result<Broker, string> {
+    var queues: Map<string, Entry> = Map.new();
+    var torn = 0;
+    let names = fs.list_dir(dir)?;
+    for f in names {
+        if (f.ends_with(".log")) {
+            let name = f.substring(0, f.len() - 4);
+            let rep_torn = wal.replay(queue_path(dir, name)).torn;
+            torn = torn + rep_torn;
+            queues.insert(name, load_queue(dir, name)?);
+        }
+    }
+    Result.Ok(Broker { dir: dir, tuning: tuning, queues: queues, torn_total: torn })
+}
+
+fn entry_of(b: Broker, name: string) -> Result<Entry, string> {
+    match (get(b.queues, name)) {
+        Option.Some(e) => Result.Ok(e),
+        Option.None => {
+            let e = load_queue(b.dir, name)?;
+            b.queues.insert(name, e);
+            Result.Ok(e)
+        },
+    }
+}
+
+fn jstr(k: string, v: string) -> Map<string, Json> {
+    var m: Map<string, Json> = Map.new();
+    m.insert(k, Json.JStr(v));
+    m
+}
+
+fn jerr(msg: string) -> Json {
+    var m: Map<string, Json> = Map.new();
+    m.insert("error", Json.JStr(msg));
+    Json.JObject(m)
+}
+
+fn do_push(b: Broker, name: string, body: string) -> Json {
+    match (entry_of(b, name)) {
+        Result.Err(e) => jerr(e),
+        Result.Ok(en) => {
+            let id = uuid.uuid_v7();
+            match (wal.append(en.log, wal.push_record(id, body, 0))) {
+                Result.Err(e) => jerr("wal append failed: " + e),
+                Result.Ok(n) => {
+                    queue.enqueue(en.state, id, body, 0);
+                    Json.JObject(jstr("id", id))
+                },
+            }
+        },
+    }
+}
+
+fn do_pull(b: Broker, name: string) -> Json {
+    match (entry_of(b, name)) {
+        Result.Err(e) => jerr(e),
+        Result.Ok(en) => {
+            match (queue.pull_one(en.state, b.tuning, time.monotonic())) {
+                Option.Some(m) => {
+                    var out: Map<string, Json> = Map.new();
+                    out.insert("id", Json.JStr(m.id));
+                    out.insert("body", Json.JStr(m.body));
+                    out.insert("attempt", Json.JNum(m.attempt as float));
+                    Json.JObject(out)
+                },
+                Option.None => Json.JNull,
+            }
+        },
+    }
+}
+
+fn maybe_compact(b: Broker, name: string, en: Entry) {
+    if (en.log.acked_since_compact < COMPACT_AFTER_ACKS) {
+        return;
+    }
+    var pend: [wal.Record] = [];
+    for m in queue.pending(en.state) {
+        pend.push(wal.push_record(m.id, m.body, m.attempt));
+    }
+    match (wal.compact(en.log, pend)) {
+        Result.Ok(fresh) => {
+            b.queues.insert(name, Entry { state: en.state, log: fresh });
+        },
+        Result.Err(e) => { },
+    }
+}
+
+fn do_ack(b: Broker, name: string, id: string) -> Json {
+    match (entry_of(b, name)) {
+        Result.Err(e) => jerr(e),
+        Result.Ok(en) => {
+            if (!queue.ack_one(en.state, id)) {
+                return jerr("unknown or not in flight: " + id);
+            }
+            wal.append(en.log, wal.ack_record(id));
+            maybe_compact(b, name, en);
+            Json.JBool(true)
+        },
+    }
+}
+
+// Dead-letter routing: ack in the source log, push in `<name>.dlq`.
+fn to_dlq(b: Broker, name: string, m: queue.Msg) {
+    match (entry_of(b, name + ".dlq")) {
+        Result.Ok(dlq) => {
+            match (wal.append(dlq.log, wal.push_record(m.id, m.body, m.attempt))) {
+                Result.Ok(n) => {
+                    queue.enqueue(dlq.state, m.id, m.body, m.attempt);
+                },
+                Result.Err(e) => { },
+            }
+        },
+        Result.Err(e) => { },
+    }
+    match (get(b.queues, name)) {
+        Option.Some(en) => {
+            wal.append(en.log, wal.ack_record(m.id));
+        },
+        Option.None => { },
+    }
+}
+
+fn do_nack(b: Broker, name: string, id: string) -> Json {
+    match (entry_of(b, name)) {
+        Result.Err(e) => jerr(e),
+        Result.Ok(en) => {
+            match (queue.nack_one(en.state, b.tuning, id, time.monotonic())) {
+                queue.NackResult.Scheduled(wait) => {
+                    wal.append(en.log, wal.nack_record(id));
+                    var m: Map<string, Json> = Map.new();
+                    m.insert("retry_in_ms", Json.JNum(wait as float));
+                    Json.JObject(m)
+                },
+                queue.NackResult.DeadLettered(msg) => {
+                    to_dlq(b, name, msg);
+                    var m: Map<string, Json> = Map.new();
+                    m.insert("dead_lettered", Json.JBool(true));
+                    Json.JObject(m)
+                },
+                queue.NackResult.Unknown => jerr("unknown or not in flight: " + id),
+            }
+        },
+    }
+}
+
+fn do_stats(b: Broker, name: string) -> Json {
+    if (name != "") {
+        return stats_one(b, name);
+    }
+    var m: Map<string, Json> = Map.new();
+    for q in b.queues.keys() {
+        m.insert(q, stats_one(b, q));
+    }
+    Json.JObject(m)
+}
+
+fn stats_one(b: Broker, name: string) -> Json {
+    match (get(b.queues, name)) {
+        Option.None => jerr("unknown queue: " + name),
+        Option.Some(en) => {
+            let d = queue.depths(en.state);
+            var m: Map<string, Json> = Map.new();
+            m.insert("ready", Json.JNum(d.ready as float));
+            m.insert("inflight", Json.JNum(d.inflight as float));
+            m.insert("delayed", Json.JNum(d.delayed as float));
+            m.insert("pushed", Json.JNum(d.pushed as float));
+            m.insert("acked", Json.JNum(d.acked as float));
+            m.insert("dead", Json.JNum(d.dead as float));
+            Json.JObject(m)
+        },
+    }
+}
+
+fn do_tick(b: Broker) {
+    let now = time.monotonic();
+    for name in b.queues.keys() {
+        match (get(b.queues, name)) {
+            Option.Some(en) => {
+                let dead = queue.tick(en.state, b.tuning, now);
+                for m in dead {
+                    to_dlq(b, name, m);
+                }
+            },
+            Option.None => { },
+        }
+    }
+}
+
+fn actor_loop(ch: Channel<Bk>, b: Broker) {
+    var running = true;
+    while (running) {
+        match (recv(ch)) {
+            Option.None => {
+                running = false;
+            },
+            Option.Some(msg) => {
+                match (msg) {
+                    Bk.Push(q, body, reply) => {
+                        send(reply, do_push(b, q, body));
+                    },
+                    Bk.Pull(q, reply) => {
+                        send(reply, do_pull(b, q));
+                    },
+                    Bk.Ack(q, id, reply) => {
+                        send(reply, do_ack(b, q, id));
+                    },
+                    Bk.Nack(q, id, reply) => {
+                        send(reply, do_nack(b, q, id));
+                    },
+                    Bk.Stats(q, reply) => {
+                        send(reply, do_stats(b, q));
+                    },
+                    Bk.Tick => {
+                        do_tick(b);
+                    },
+                }
+            },
+        }
+    }
+}
+
+// One request/reply round trip (used by the RPC handler and by tests).
+pub fn ask(ch: Channel<Bk>, make: fn(Channel<Json>) -> Bk) -> Json {
+    let reply: Channel<Json> = Channel.bounded(1);
+    send(ch, make(reply));
+    match (recv(reply)) {
+        Option.Some(j) => j,
+        Option.None => Json.JNull,
+    }
+}

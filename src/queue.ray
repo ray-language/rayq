@@ -1,0 +1,204 @@
+// rayq — the per-queue state machine, pure of clocks and I/O: every function
+// takes `now_ms` explicitly so tests drive time by hand.
+//
+// Lifecycle: push → ready → pull → in-flight (visibility deadline) →
+//   ack: gone · nack: delayed with exponential backoff → ready again ·
+//   visibility expired: back to ready (attempt + 1) ·
+//   attempts exhausted: reported as dead-lettered (the broker routes it).
+import std/collections/deque;
+
+pub struct Msg {
+    id: string,
+    body: string,
+    attempt: int,
+}
+
+struct InFlight {
+    msg: Msg,
+    deadline_ms: int,
+}
+
+struct Delayed {
+    msg: Msg,
+    due_ms: int,
+}
+
+pub struct Tuning {
+    visibility_ms: int,
+    max_attempts: int,
+    backoff_base_ms: int,
+    backoff_max_ms: int,
+}
+
+pub fn default_tuning() -> Tuning {
+    Tuning { visibility_ms: 30000, max_attempts: 5, backoff_base_ms: 1000, backoff_max_ms: 60000 }
+}
+
+pub struct QueueState {
+    ready: deque.Deque<Msg>,
+    inflight: Map<string, InFlight>,
+    delayed: [Delayed],
+    pushed: int,
+    acked: int,
+    dead: int,
+}
+
+pub fn new_queue() -> QueueState {
+    var ready: deque.Deque<Msg> = deque.new();
+    var inflight: Map<string, InFlight> = Map.new();
+    var delayed: [Delayed] = [];
+    QueueState { ready: ready, inflight: inflight, delayed: delayed, pushed: 0, acked: 0, dead: 0 }
+}
+
+pub fn enqueue(q: QueueState, id: string, body: string, attempt: int) {
+    deque.push_back(q.ready, Msg { id: id, body: body, attempt: attempt });
+    q.pushed = q.pushed + 1;
+}
+
+// Hands the oldest ready message to a consumer and starts its visibility clock.
+pub fn pull_one(q: QueueState, t: Tuning, now_ms: int) -> Option<Msg> {
+    match (deque.pop_front(q.ready)) {
+        Option.Some(m) => {
+            let attempt = m.attempt + 1;
+            let out = Msg { id: m.id, body: m.body, attempt: attempt };
+            q.inflight.insert(m.id, InFlight { msg: out, deadline_ms: now_ms + t.visibility_ms });
+            Option.Some(out)
+        },
+        Option.None => Option.None,
+    }
+}
+
+pub fn ack_one(q: QueueState, id: string) -> bool {
+    if (q.inflight.contains_key(id)) {
+        q.inflight.remove(id);
+        q.acked = q.acked + 1;
+        return true;
+    }
+    false
+}
+
+fn backoff_ms(t: Tuning, attempt: int) -> int {
+    var ms = t.backoff_base_ms;
+    var i = 1;
+    while (i < attempt && ms < t.backoff_max_ms) {
+        ms = ms * 2;
+        i = i + 1;
+    }
+    if (ms > t.backoff_max_ms) { t.backoff_max_ms } else { ms }
+}
+
+// The nack outcome: retry later, or give the message up as dead.
+pub enum NackResult {
+    Scheduled(int),
+    DeadLettered(Msg),
+    Unknown,
+}
+
+pub fn nack_one(q: QueueState, t: Tuning, id: string, now_ms: int) -> NackResult {
+    match (get(q.inflight, id)) {
+        Option.Some(inf) => {
+            q.inflight.remove(id);
+            if (inf.msg.attempt >= t.max_attempts) {
+                q.dead = q.dead + 1;
+                return NackResult.DeadLettered(inf.msg);
+            }
+            let wait = backoff_ms(t, inf.msg.attempt);
+            q.delayed.push(Delayed { msg: inf.msg, due_ms: now_ms + wait });
+            NackResult.Scheduled(wait)
+        },
+        Option.None => NackResult.Unknown,
+    }
+}
+
+// Advances time: due retries go back to ready, and in-flight messages whose
+// visibility expired are redelivered (or dead-lettered when out of attempts).
+// Returns the dead-lettered messages for the broker to route.
+pub fn tick(q: QueueState, t: Tuning, now_ms: int) -> [Msg] {
+    var dead: [Msg] = [];
+    var keep: [Delayed] = [];
+    for d in q.delayed {
+        if (d.due_ms <= now_ms) {
+            deque.push_back(q.ready, d.msg);
+        } else {
+            keep.push(d);
+        }
+    }
+    q.delayed = keep;
+    var expired: [string] = [];
+    for id in q.inflight.keys() {
+        match (get(q.inflight, id)) {
+            Option.Some(inf) => {
+                if (inf.deadline_ms <= now_ms) {
+                    expired.push(id);
+                }
+            },
+            Option.None => { },
+        }
+    }
+    for id in expired {
+        match (get(q.inflight, id)) {
+            Option.Some(inf) => {
+                q.inflight.remove(id);
+                if (inf.msg.attempt >= t.max_attempts) {
+                    q.dead = q.dead + 1;
+                    dead.push(inf.msg);
+                } else {
+                    deque.push_back(q.ready, inf.msg);
+                }
+            },
+            Option.None => { },
+        }
+    }
+    dead
+}
+
+pub struct Depths {
+    ready: int,
+    inflight: int,
+    delayed: int,
+    pushed: int,
+    acked: int,
+    dead: int,
+}
+
+pub fn depths(q: QueueState) -> Depths {
+    Depths {
+        ready: deque.len(q.ready),
+        inflight: q.inflight.keys().len(),
+        delayed: q.delayed.len(),
+        pushed: q.pushed,
+        acked: q.acked,
+        dead: q.dead
+    }
+}
+
+// Everything still owed to consumers (for WAL compaction): ready + in-flight +
+// delayed, each with its current attempt count.
+pub fn pending(q: QueueState) -> [Msg] {
+    var out: [Msg] = [];
+    // Deque has no indexed peek: rotate through it (len pops + pushes).
+    var i = 0;
+    let n = deque.len(q.ready);
+    while (i < n) {
+        match (deque.pop_front(q.ready)) {
+            Option.Some(m) => {
+                out.push(m);
+                deque.push_back(q.ready, m);
+            },
+            Option.None => { },
+        }
+        i = i + 1;
+    }
+    for id in q.inflight.keys() {
+        match (get(q.inflight, id)) {
+            Option.Some(inf) => {
+                out.push(inf.msg);
+            },
+            Option.None => { },
+        }
+    }
+    for d in q.delayed {
+        out.push(d.msg);
+    }
+    out
+}

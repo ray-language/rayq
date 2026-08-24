@@ -1,0 +1,66 @@
+// Throughput: N pushes, then pull+ack drain, one RPC connection each phase.
+import std/time;
+import std/json;
+from std/json import Json;
+import rpc/rpc;
+
+const N: int = 2000;
+
+fn params(pairs: [(string, string)]) -> Json {
+    var m: Map<string, Json> = Map.new();
+    for (k, v) in pairs.iter() {
+        m.insert(k, Json.JStr(v));
+    }
+    Json.JObject(m)
+}
+
+fn main() -> int {
+    let c = match (rpc.connect("127.0.0.1", 18971)) {
+        Result.Ok(x) => x,
+        Result.Err(e) => {
+            eprint(e);
+            return 1;
+        },
+    };
+    var t0 = time.monotonic();
+    var i = 0;
+    while (i < N) {
+        rpc.call(c, "push", params([("queue", "bench"), ("body", "payload-" + to_string(i))]));
+        i = i + 1;
+    }
+    var ms = time.monotonic() - t0;
+    print(
+        "push: " + to_string(N) + " in " + to_string(ms) + " ms = " + to_string(N * 1000 / ms) + " msg/s"
+    );
+    t0 = time.monotonic();
+    var drained = 0;
+    var more = true;
+    while (more) {
+        match (rpc.call(c, "pull", params([("queue", "bench")]))) {
+            Result.Ok(j) => {
+                if (json.is_null(j)) {
+                    more = false;
+                } else {
+                    match (json.get_string(j, "id")) {
+                        Option.Some(id) => {
+                            rpc.call(c, "ack", params([("queue", "bench"), ("id", id)]));
+                            drained = drained + 1;
+                        },
+                        Option.None => {
+                            more = false;
+                        },
+                    }
+                }
+            },
+            Result.Err(e) => {
+                more = false;
+            },
+        }
+    }
+    ms = time.monotonic() - t0;
+    print(
+        "pull+ack: " + to_string(drained) + " in " + to_string(ms) + " ms = " + to_string(drained * 1000 / ms) + " msg/s"
+    );
+    rpc.disconnect(c);
+    0
+}

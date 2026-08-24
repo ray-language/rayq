@@ -1,0 +1,167 @@
+// rayq — persistent at-least-once message queue broker over packages/rpc.
+import queue;
+import broker;
+import server;
+import client;
+
+const DEFAULT_PORT: int = 7450;
+
+fn usage() {
+    eprint("usage:");
+    eprint("  rayq serve [--dir DIR] [--bind H] [--port N] [--visibility MS]");
+    eprint("             [--max-attempts N] [--drain MS]");
+    eprint("  rayq push QUEUE BODY        [--server H] [--port N]");
+    eprint("  rayq pull QUEUE [--wait MS] [--ack]   (prints id<TAB>attempt<TAB>body)");
+    eprint("  rayq ack QUEUE ID");
+    eprint("  rayq nack QUEUE ID          (backoff retry; DLQ '<queue>.dlq' when spent)");
+    eprint("  rayq stats [QUEUE]");
+    eprint("  rayq worker QUEUE -- CMD [ARGS...]   (body on stdin; exit 0 = ack)");
+    eprint("");
+    eprint(
+        "  defaults: dir ./rayq-data, port " + to_string(DEFAULT_PORT) + ", visibility 30000 ms, max attempts 5"
+    );
+}
+
+fn flag_value(av: [string], name: string) -> Option<string> {
+    var i = 0;
+    while (i + 1 < av.len()) {
+        if (av[i] == name) {
+            return Option.Some(av[i + 1]);
+        }
+        i = i + 1;
+    }
+    Option.None
+}
+
+fn flag_int(av: [string], name: string, fallback: int) -> int {
+    match (flag_value(av, name)) {
+        Option.Some(s) => {
+            match (parse_int(s)) {
+                Option.Some(n) => n,
+                Option.None => fallback,
+            }
+        },
+        Option.None => fallback,
+    }
+}
+
+fn flag_str(av: [string], name: string, fallback: string) -> string {
+    match (flag_value(av, name)) {
+        Option.Some(s) => s,
+        Option.None => fallback,
+    }
+}
+
+fn has_flag(av: [string], name: string) -> bool {
+    for a in av {
+        if (a == name) {
+            return true;
+        }
+    }
+    false
+}
+
+// Positional args: everything before `--` that does not start with a dash and
+// is not a flag VALUE.
+fn positionals(av: [string]) -> [string] {
+    var out: [string] = [];
+    var i = 1;
+    var skip = false;
+    while (i < av.len()) {
+        let a = av[i];
+        if (a == "--") {
+            return out;
+        }
+        if (skip) {
+            skip = false;
+        } else if (a.starts_with("--")) {
+            skip = a != "--ack";
+        } else {
+            out.push(a);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn after_dashdash(av: [string]) -> [string] {
+    var out: [string] = [];
+    var seen = false;
+    for a in av {
+        if (seen) {
+            out.push(a);
+        } else if (a == "--") {
+            seen = true;
+        }
+    }
+    out
+}
+
+fn main() -> int {
+    let av = args();
+    if (av.len() < 1 || av[0] == "--help" || av[0] == "-h" || av[0] == "help") {
+        usage();
+        return if (av.len() < 1) { 1 } else { 0 };
+    }
+    let cmd = av[0];
+    let host = flag_str(av, "--server", "127.0.0.1");
+    let port = flag_int(av, "--port", DEFAULT_PORT);
+    let pos = positionals(av);
+    if (cmd == "serve") {
+        var tuning = queue.default_tuning();
+        tuning.visibility_ms = flag_int(av, "--visibility", tuning.visibility_ms);
+        tuning.max_attempts = flag_int(av, "--max-attempts", tuning.max_attempts);
+        let dir = flag_str(av, "--dir", "./rayq-data");
+        match (broker.start(dir, tuning)) {
+            Result.Err(e) => {
+                eprint("rayq: " + e);
+                1
+            },
+            Result.Ok(bk) => {
+                match (server.run(
+                flag_str(av, "--bind", "0.0.0.0"),
+                port,
+                bk,
+                flag_int(av, "--drain", 3000)
+            )) {
+                    Result.Ok(code) => code,
+                    Result.Err(e) => {
+                        eprint("rayq: " + e);
+                        1
+                    },
+                }
+            },
+        }
+    } else if (cmd == "push") {
+        if (pos.len() < 2) {
+            usage();
+            return 1;
+        }
+        client.push(host, port, pos[0], pos[1])
+    } else if (cmd == "pull") {
+        if (pos.len() < 1) {
+            usage();
+            return 1;
+        }
+        client.pull(host, port, pos[0], flag_int(av, "--wait", 0), has_flag(av, "--ack"))
+    } else if (cmd == "ack" || cmd == "nack") {
+        if (pos.len() < 2) {
+            usage();
+            return 1;
+        }
+        client.simple(host, port, cmd, pos[0], pos[1])
+    } else if (cmd == "stats") {
+        let q = if (pos.len() > 0) { pos[0] } else { "" };
+        client.stats(host, port, q)
+    } else if (cmd == "worker") {
+        if (pos.len() < 1) {
+            usage();
+            return 1;
+        }
+        client.worker(host, port, pos[0], after_dashdash(av))
+    } else {
+        eprint("rayq: unknown command: " + cmd);
+        usage();
+        1
+    }
+}

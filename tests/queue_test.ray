@@ -1,0 +1,125 @@
+// The queue state machine with hand-driven time.
+import queue;
+
+fn tuning() -> queue.Tuning {
+    queue.Tuning { visibility_ms: 1000, max_attempts: 3, backoff_base_ms: 100, backoff_max_ms: 400 }
+}
+
+@test
+fn push_pull_ack_lifecycle() {
+    var q = queue.new_queue();
+    let t = tuning();
+    queue.enqueue(q, "a", "uno", 0);
+    queue.enqueue(q, "b", "dos", 0);
+    let m = match (queue.pull_one(q, t, 0)) {
+        Option.Some(x) => x,
+        Option.None => panic("expected a message"),
+    };
+    assert_eq(m.id, "a");
+    assert_eq(m.attempt, 1);
+    let d = queue.depths(q);
+    assert_eq(d.ready, 1);
+    assert_eq(d.inflight, 1);
+    assert(queue.ack_one(q, "a"));
+    assert(!queue.ack_one(q, "a"));
+    assert_eq(queue.depths(q).inflight, 0);
+    assert_eq(queue.depths(q).acked, 1);
+}
+
+@test
+fn visibility_expiry_redelivers_with_higher_attempt() {
+    var q = queue.new_queue();
+    let t = tuning();
+    queue.enqueue(q, "a", "uno", 0);
+    queue.pull_one(q, t, 0);
+    assert_eq(queue.tick(q, t, 500).len(), 0);
+    assert_eq(queue.depths(q).inflight, 1);
+    assert_eq(queue.tick(q, t, 1001).len(), 0);
+    assert_eq(queue.depths(q).inflight, 0);
+    assert_eq(queue.depths(q).ready, 1);
+    let m = match (queue.pull_one(q, t, 2000)) {
+        Option.Some(x) => x,
+        Option.None => panic("expected redelivery"),
+    };
+    assert_eq(m.attempt, 2);
+}
+
+@test
+fn nack_backoff_then_ready_again() {
+    var q = queue.new_queue();
+    let t = tuning();
+    queue.enqueue(q, "a", "uno", 0);
+    queue.pull_one(q, t, 0);
+    match (queue.nack_one(q, t, "a", 0)) {
+        queue.NackResult.Scheduled(wait) => assert_eq(wait, 100),
+        _ => panic("expected Scheduled"),
+    }
+    assert_eq(queue.depths(q).delayed, 1);
+    queue.tick(q, t, 50);
+    assert_eq(queue.depths(q).ready, 0);
+    queue.tick(q, t, 150);
+    assert_eq(queue.depths(q).ready, 1);
+    assert_eq(queue.depths(q).delayed, 0);
+    // Second nack doubles the backoff.
+    queue.pull_one(q, t, 200);
+    match (queue.nack_one(q, t, "a", 200)) {
+        queue.NackResult.Scheduled(wait) => assert_eq(wait, 200),
+        _ => panic("expected Scheduled"),
+    }
+}
+
+@test
+fn attempts_exhausted_dead_letters() {
+    var q = queue.new_queue();
+    let t = tuning();
+    queue.enqueue(q, "a", "uno", 0);
+    var now = 0;
+    var dead = false;
+    var rounds = 0;
+    while (!dead && rounds < 10) {
+        match (queue.pull_one(q, t, now)) {
+            Option.Some(m) => {
+                match (queue.nack_one(q, t, m.id, now)) {
+                    queue.NackResult.Scheduled(wait) => {
+                        now = now + wait + 1;
+                        queue.tick(q, t, now);
+                    },
+                    queue.NackResult.DeadLettered(msg) => {
+                        dead = true;
+                        assert_eq(msg.attempt, 3);
+                    },
+                    queue.NackResult.Unknown => panic("unexpected Unknown"),
+                }
+            },
+            Option.None => panic("queue drained before dead-letter"),
+        }
+        rounds = rounds + 1;
+    }
+    assert(dead);
+    assert_eq(rounds, 3);
+    assert_eq(queue.depths(q).dead, 1);
+    assert_eq(queue.depths(q).ready, 0);
+}
+
+@test
+fn pending_covers_ready_inflight_and_delayed() {
+    var q = queue.new_queue();
+    let t = tuning();
+    queue.enqueue(q, "a", "ready", 0);
+    queue.enqueue(q, "b", "inflight", 0);
+    queue.enqueue(q, "c", "delayed", 0);
+    queue.pull_one(q, t, 0);
+    let mb = match (queue.pull_one(q, t, 0)) {
+        Option.Some(x) => x,
+        Option.None => panic("no b"),
+    };
+    // a stays in flight; b gets nacked into delayed… wait: first pull was a.
+    queue.nack_one(q, t, mb.id, 0);
+    let pend = queue.pending(q);
+    assert_eq(pend.len(), 3);
+    // The ready deque is intact after the rotation in pending().
+    match (queue.pull_one(q, t, 0)) {
+        Option.Some(m) => assert_eq(m.id, "c"),
+        Option.None => panic("ready lost by pending()"),
+    }
+}
