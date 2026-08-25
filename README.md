@@ -41,9 +41,10 @@ in-flight vuelven a `ready`, los ackeados no reaparecen. La **compactación**
 renombra encima (`fs.rename` atómico), reabriendo el handle (el viejo apunta
 al inode antiguo).
 
-**Límite honesto**: `std/fs` no tiene `fsync` — el append es durable ante un
-crash del proceso, NO ante un corte de luz (hallazgo anotado). Y no hay file
-locks: dos brokers sobre el mismo dir se corrompen mutuamente sin aviso.
+**Durabilidad y exclusión (resueltas en raylang M115)**: cada append pasa por
+`fs.sync` (durable ante corte de luz, no solo ante crash del proceso), y el
+broker toma un `flock` consultivo sobre `<dir>/LOCK` al arrancar — un segundo
+broker sobre el mismo dir falla con un error claro en vez de corromper.
 
 ## Uso
 
@@ -62,7 +63,7 @@ default es 7450; RPC = frames con prefijo de longitud + JSON (`packages/rpc`).
 
 Cliente único secuencial, misma máquina, broker nativo: **~6.8k push/s** y
 ~3.6k pull+ack/s (2 RPC por mensaje → ~7.3k RPC/s); broker en VM: ~4.2k / ~2.5k.
-Cada push es un append a disco (sin fsync, ver arriba).
+Cada push es un append a disco con `fs.sync` (durable de verdad).
 
 ## Estado actual
 
@@ -77,18 +78,18 @@ Cada push es un append a disco (sin fsync, ver arriba).
 | Apagado graceful (SIGTERM/SIGINT vía rpc.serve_graceful) | ✅ |
 | Binario nativo (broker y cliente; E2E verificado) | ✅ |
 | Tests (WAL, máquina de estados con tiempo manual, E2E con reinicio) | ✅ 10 |
-| fsync / durabilidad ante corte de luz | ❌ bloqueado (sin `fs.sync`) |
-| File locks (dos brokers, mismo dir) | ❌ bloqueado (sin flock) |
+| fsync / durabilidad ante corte de luz | ✅ (raylang M115.1: `fs.sync` por append) |
+| File locks (dos brokers, mismo dir) | ✅ (raylang M115.2: flock sobre `LOCK`) |
 | Long-poll servidor (`pull --wait` sondea del lado cliente) | 📋 v2 |
 
 ## Hallazgos de dogfood (necesidades confirmadas del lenguaje)
 
 Anotados en `raylang/IDEAS.md` §66:
 
-1. **`std/fs` no tiene `fsync`/flush** — la predicción central del catálogo,
-   confirmada: un broker no puede prometer durabilidad ante corte de luz.
-2. **No hay file locks** (`flock`): nada impide dos brokers sobre el mismo
-   dir corrompiéndose en silencio.
+1. **[RESUELTO — raylang M115.1]** `std/fs` no tiene `fsync`/flush: `fs.sync`
+   existe y el WAL lo llama por append.
+2. **[RESUELTO — raylang M115.2]** No hay file locks: `fs.try_lock` existe y
+   el broker candea `<dir>/LOCK` (con `broker.stop` para soltarlo ordenado).
 3. `fs.rename` SÍ existe y funciona como reemplazo atómico (la compactación
    entera se apoya en él); `truncate` no hizo falta gracias a ese patrón.
 4. **Positivo — `packages/rpc` funcionó a la primera** en su estreno:
