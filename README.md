@@ -1,6 +1,6 @@
 # rayq
 
-Broker de colas de trabajos **persistente** con entrega *at-least-once*, escrito en [raylang](https://github.com/roberto-ayala/raylang): productores y consumidores hablan `packages/rpc` (estreno del paquete), cada cola persiste en un log append-only (WAL) que sobrevive a un `kill -9`, los mensajes sin ack se re-entregan por *visibility timeout*, los `nack` reintentan con backoff exponencial y, agotados los intentos, caen a la dead-letter queue `<cola>.dlq`.
+Broker de colas de trabajos **persistente** con entrega *at-least-once*, escrito en [raylang](https://github.com/ray-language/raylang): productores y consumidores hablan `packages/rpc` (estreno del paquete), cada cola persiste en un log append-only (WAL) que sobrevive a un `kill -9`, los mensajes sin ack se re-entregan por *visibility timeout*, los `nack` reintentan con backoff exponencial y, agotados los intentos, caen a la dead-letter queue `<cola>.dlq`.
 
 ```text
 $ rayq serve --dir ./rayq-data &
