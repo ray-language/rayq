@@ -144,6 +144,9 @@ fn broker_end_to_end() {
     call_ok(c, "pull", params([("queue", "jobs")]));
     rpc.disconnect(c);
 
+    // Apagado ordenado del primer broker: suelta el candado del dir (M115.2) — sin esto el
+    // segundo boot EN el mismo proceso choca con el flock (que no muere con la fibra).
+    broker.stop(bk);
     boot(PORT_B);
     let c2 = connect(PORT_B);
     let s1 = call_ok(c2, "pull", params([("queue", "jobs")]));

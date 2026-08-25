@@ -24,6 +24,9 @@ pub enum Bk {
     Nack(string, string, Channel<Json>),
     Stats(string, Channel<Json>),
     Tick,
+    // Apagado ordenado: cierra los WAL y suelta el candado del directorio (raylang M115.2) —
+    // imprescindible para un reinicio EN el mismo proceso (el flock no muere con la fibra).
+    Stop(Channel<int>),
 }
 
 struct Entry {
@@ -36,14 +39,28 @@ struct Broker {
     tuning: queue.Tuning,
     queues: Map<string, Entry>,
     torn_total: int,
+    lock_h: int,
 }
 
 pub fn start(dir: string, tuning: queue.Tuning) -> Result<Channel<Bk>, string> {
     if (!fs.exists(dir)) {
         fs.mkdir(dir)?;
     }
+    // Candado del directorio (raylang M115.2): dos brokers sobre el MISMO dir intercalarian
+    // appends y doble-entregarian. flock consultivo sobre un LOCK file, retenido de por vida.
+    let lock_h = fs.open(dir + "/LOCK", "a")?;
+    match (fs.try_lock(lock_h)) {
+        Result.Ok(acquired) => {
+            if (!acquired) {
+                return Result.Err("another rayq broker already holds " + dir + "/LOCK");
+            }
+        },
+        Result.Err(e) => {
+            return Result.Err("could not lock " + dir + "/LOCK: " + e);
+        },
+    }
     let ch: Channel<Bk> = Channel.bounded(256);
-    let b = load(dir, tuning)?;
+    let b = load(dir, tuning, lock_h)?;
     spawn(fn() {
         actor_loop(ch, b);
     });
@@ -105,7 +122,7 @@ fn load_queue(dir: string, name: string) -> Result<Entry, string> {
     Result.Ok(Entry { state: state, log: compacted })
 }
 
-fn load(dir: string, tuning: queue.Tuning) -> Result<Broker, string> {
+fn load(dir: string, tuning: queue.Tuning, lock_h: int) -> Result<Broker, string> {
     var queues: Map<string, Entry> = Map.new();
     var torn = 0;
     let names = fs.list_dir(dir)?;
@@ -117,7 +134,7 @@ fn load(dir: string, tuning: queue.Tuning) -> Result<Broker, string> {
             queues.insert(name, load_queue(dir, name)?);
         }
     }
-    Result.Ok(Broker { dir: dir, tuning: tuning, queues: queues, torn_total: torn })
+    Result.Ok(Broker { dir: dir, tuning: tuning, queues: queues, torn_total: torn, lock_h: lock_h })
 }
 
 fn entry_of(b: Broker, name: string) -> Result<Entry, string> {
@@ -294,6 +311,14 @@ fn do_tick(b: Broker) {
     }
 }
 
+/// Orderly shutdown: closes the WALs and releases the directory lock, so a
+/// fresh broker (same or another process) can take over the data dir.
+pub fn stop(ch: Channel<Bk>) {
+    let done: Channel<int> = Channel.bounded(1);
+    send(ch, Bk.Stop(done));
+    let _ = recv(done);
+}
+
 fn actor_loop(ch: Channel<Bk>, b: Broker) {
     var running = true;
     while (running) {
@@ -317,6 +342,18 @@ fn actor_loop(ch: Channel<Bk>, b: Broker) {
                     },
                     Bk.Stats(q, reply) => {
                         send(reply, do_stats(b, q));
+                    },
+                    Bk.Stop(done) => {
+                        for name in b.queues.keys() {
+                            match (get(b.queues, name)) {
+                                Option.Some(entry) => wal.close_wal(entry.log),
+                                Option.None => { },
+                            }
+                        }
+                        let _ = fs.unlock(b.lock_h);
+                        close(b.lock_h);
+                        send(done, 1);
+                        running = false;
                     },
                     Bk.Tick => {
                         do_tick(b);
