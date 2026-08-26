@@ -3,4 +3,4 @@ name = "rayq"
 version = "0.1.0"
 
 [dependencies]
-rpc = "path:../../raylang/packages/rpc"
+rpc = "git+https://github.com/ray-language/rpc@v0.1.0"
