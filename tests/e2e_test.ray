@@ -11,24 +11,9 @@ import queue;
 import broker;
 import server;
 
-const DIR: string = "/tmp/rayq_e2e_data";
-
 const PORT_A: int = 18951;
 
 const PORT_B: int = 18952;
-
-fn wipe() {
-    if (fs.exists(DIR)) {
-        match (fs.list_dir(DIR)) {
-            Result.Ok(names) => {
-                for f in names {
-                    fs.remove_file(DIR + "/" + f);
-                }
-            },
-            Result.Err(e) => { },
-        }
-    }
-}
 
 fn tuning() -> queue.Tuning {
     queue.Tuning {
@@ -39,8 +24,8 @@ fn tuning() -> queue.Tuning {
     }
 }
 
-fn boot(port: int) -> Channel<broker.Bk> {
-    let bk = match (broker.start(DIR, tuning())) {
+fn boot(dir: string, port: int) -> Channel<broker.Bk> {
+    let bk = match (broker.start(dir, tuning())) {
         Result.Ok(b) => b,
         Result.Err(e) => panic(e),
     };
@@ -89,8 +74,11 @@ fn int_of(j: Json, k: string) -> int {
 
 @test
 fn broker_end_to_end() {
-    wipe();
-    let bk = boot(PORT_A);
+    let dir = match (fs.make_temp_dir("rayq_e2e")) {
+        Result.Ok(d) => d,
+        Result.Err(e) => panic(e),
+    };
+    let bk = boot(dir, PORT_A);
     let c = connect(PORT_A);
 
     // push/pull/ack round trip.
@@ -147,7 +135,7 @@ fn broker_end_to_end() {
     // Apagado ordenado del primer broker: suelta el candado del dir (M115.2) — sin esto el
     // segundo boot EN el mismo proceso choca con el flock (que no muere con la fibra).
     broker.stop(bk);
-    boot(PORT_B);
+    boot(dir, PORT_B);
     let c2 = connect(PORT_B);
     let s1 = call_ok(c2, "pull", params([("queue", "jobs")]));
     assert_eq(str_of(s1, "id"), id4);
@@ -157,4 +145,5 @@ fn broker_end_to_end() {
     let s2 = call_ok(c2, "pull", params([("queue", "jobs.dlq")]));
     assert_eq(str_of(s2, "id"), id2);
     rpc.disconnect(c2);
+    fs.remove_all(dir);
 }

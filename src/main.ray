@@ -54,15 +54,6 @@ fn flag_str(av: [string], name: string, fallback: string) -> string {
     }
 }
 
-fn has_flag(av: [string], name: string) -> bool {
-    for a in av {
-        if (a == name) {
-            return true;
-        }
-    }
-    false
-}
-
 // Positional args: everything before `--` that does not start with a dash and
 // is not a flag VALUE.
 fn positionals(av: [string]) -> [string] {
@@ -145,7 +136,7 @@ fn main() -> int {
             usage();
             return 1;
         }
-        client.pull(host, port, pos[0], flag_int(av, "--wait", 0), has_flag(av, "--ack"))
+        client.pull(host, port, pos[0], flag_int(av, "--wait", 0), av.contains("--ack"))
     } else if (cmd == "ack" || cmd == "nack") {
         if (pos.len() < 2) {
             usage();

@@ -54,7 +54,7 @@ pub fn push(host: string, port: int, q: string, body: string) -> int {
 // "id<TAB>attempt<TAB>body"; --ack acknowledges right away (at-most-once!).
 pub fn pull(host: string, port: int, q: string, wait_ms: int, auto_ack: bool) -> int {
     with_client(host, port, fn(c: rpc.Client) -> int {
-        let deadline = time.monotonic() + wait_ms;
+        let deadline = time.monotonic_millis() + wait_ms;
         while (true) {
             match (rpc.call(c, "pull", params1("queue", q))) {
                 Result.Err(e) => {
@@ -81,7 +81,7 @@ pub fn pull(host: string, port: int, q: string, wait_ms: int, auto_ack: bool) ->
                         }
                         return 0;
                     }
-                    if (time.monotonic() >= deadline) {
+                    if (time.monotonic_millis() >= deadline) {
                         eprint("rayq: queue '" + q + "' is empty");
                         return 2;
                     }
@@ -164,23 +164,13 @@ pub fn worker(host: string, port: int, q: string, argv: [string]) -> int {
                             i = i + 1;
                         }
                         let ran = process.cmd(argv[0], rest).stdin(body.to_bytes()).run();
-                        var ok = false;
-                        match (ran) {
-                            Result.Ok(out) => {
-                                match (out.exit) {
-                                    process.Exit.Code(code) => {
-                                        ok = code == 0;
-                                    },
-                                    process.Exit.Signal(sig) => {
-                                        ok = false;
-                                    },
-                                }
-                            },
+                        let ok = match (ran) {
+                            Result.Ok(out) => out.exit == process.Exit.Code(0),
                             Result.Err(e) => {
                                 eprint("rayq: could not launch: " + e);
-                                ok = false;
+                                false
                             },
-                        }
+                        };
                         let verb = if (ok) { "ack" } else { "nack" };
                         rpc.call(c, verb, params2("queue", q, "id", id));
                         eprint(verb + " " + id);

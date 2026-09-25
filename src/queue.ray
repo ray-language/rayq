@@ -51,13 +51,13 @@ pub fn new_queue() -> QueueState {
 }
 
 pub fn enqueue(q: QueueState, id: string, body: string, attempt: int) {
-    deque.push_back(q.ready, Msg { id: id, body: body, attempt: attempt });
+    q.ready.push_back(Msg { id: id, body: body, attempt: attempt });
     q.pushed = q.pushed + 1;
 }
 
 // Hands the oldest ready message to a consumer and starts its visibility clock.
 pub fn pull_one(q: QueueState, t: Tuning, now_ms: int) -> Option<Msg> {
-    match (deque.pop_front(q.ready)) {
+    match (q.ready.pop_front()) {
         Option.Some(m) => {
             let attempt = m.attempt + 1;
             let out = Msg { id: m.id, body: m.body, attempt: attempt };
@@ -118,35 +118,25 @@ pub fn tick(q: QueueState, t: Tuning, now_ms: int) -> [Msg] {
     var keep: [Delayed] = [];
     for d in q.delayed {
         if (d.due_ms <= now_ms) {
-            deque.push_back(q.ready, d.msg);
+            q.ready.push_back(d.msg);
         } else {
             keep.push(d);
         }
     }
     q.delayed = keep;
-    var expired: [string] = [];
-    for id in q.inflight.keys() {
-        match (get(q.inflight, id)) {
-            Option.Some(inf) => {
-                if (inf.deadline_ms <= now_ms) {
-                    expired.push(id);
-                }
-            },
-            Option.None => { },
+    var expired: [InFlight] = [];
+    for (id, inf) in q.inflight {
+        if (inf.deadline_ms <= now_ms) {
+            expired.push(inf);
         }
     }
-    for id in expired {
-        match (get(q.inflight, id)) {
-            Option.Some(inf) => {
-                q.inflight.remove(id);
-                if (inf.msg.attempt >= t.max_attempts) {
-                    q.dead = q.dead + 1;
-                    dead.push(inf.msg);
-                } else {
-                    deque.push_back(q.ready, inf.msg);
-                }
-            },
-            Option.None => { },
+    for inf in expired {
+        q.inflight.remove(inf.msg.id);
+        if (inf.msg.attempt >= t.max_attempts) {
+            q.dead = q.dead + 1;
+            dead.push(inf.msg);
+        } else {
+            q.ready.push_back(inf.msg);
         }
     }
     dead
@@ -163,8 +153,8 @@ pub struct Depths {
 
 pub fn depths(q: QueueState) -> Depths {
     Depths {
-        ready: deque.len(q.ready),
-        inflight: q.inflight.keys().len(),
+        ready: q.ready.len(),
+        inflight: q.inflight.len(),
         delayed: q.delayed.len(),
         pushed: q.pushed,
         acked: q.acked,
@@ -178,24 +168,19 @@ pub fn pending(q: QueueState) -> [Msg] {
     var out: [Msg] = [];
     // Deque has no indexed peek: rotate through it (len pops + pushes).
     var i = 0;
-    let n = deque.len(q.ready);
+    let n = q.ready.len();
     while (i < n) {
-        match (deque.pop_front(q.ready)) {
+        match (q.ready.pop_front()) {
             Option.Some(m) => {
                 out.push(m);
-                deque.push_back(q.ready, m);
+                q.ready.push_back(m);
             },
             Option.None => { },
         }
         i = i + 1;
     }
-    for id in q.inflight.keys() {
-        match (get(q.inflight, id)) {
-            Option.Some(inf) => {
-                out.push(inf.msg);
-            },
-            Option.None => { },
-        }
+    for (id, inf) in q.inflight {
+        out.push(inf.msg);
     }
     for d in q.delayed {
         out.push(d.msg);
