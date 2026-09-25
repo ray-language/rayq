@@ -2,22 +2,16 @@
 import std/fs;
 import wal;
 
-const DIR: string = "/tmp/rayq_wal_test";
-
+// A fresh, unique temp dir per test; returns the log path inside it.
 fn reset() -> string {
-    if (fs.exists(DIR)) {
-        match (fs.list_dir(DIR)) {
-            Result.Ok(names) => {
-                for f in names {
-                    fs.remove_file(DIR + "/" + f);
-                }
-            },
-            Result.Err(e) => { },
-        }
-    } else {
-        fs.mkdir(DIR);
+    match (fs.make_temp_dir("rayq_wal")) {
+        Result.Ok(d) => d + "/q.log",
+        Result.Err(e) => panic(e),
     }
-    DIR + "/q.log"
+}
+
+fn cleanup(path: string) {
+    fs.remove_all(path.substring(0, path.len() - "/q.log".len()));
 }
 
 fn must_open(path: string) -> wal.Wal {
@@ -45,6 +39,7 @@ fn append_and_replay_round_trip() {
     assert_eq(rep.records[2].op, "ack");
     assert_eq(rep.records[3].op, "nack");
     assert_eq(rep.records[3].id, "01-bbb");
+    cleanup(path);
 }
 
 @test
@@ -59,6 +54,7 @@ fn torn_tail_is_discarded_not_fatal() {
     assert_eq(rep.records.len(), 1);
     assert_eq(rep.records[0].id, "01-aaa");
     assert_eq(rep.torn, 1);
+    cleanup(path);
 }
 
 @test
@@ -75,6 +71,7 @@ fn corrupt_middle_line_is_skipped() {
     assert_eq(rep.records.len(), 2);
     assert_eq(rep.torn, 1);
     assert_eq(rep.records[1].id, "01-ccc");
+    cleanup(path);
 }
 
 @test
@@ -99,4 +96,5 @@ fn compact_keeps_only_pending_and_reopens() {
     assert_eq(rep.records[0].attempt, 3);
     assert_eq(rep.records[1].op, "ack");
     assert(!fs.exists(path + ".tmp"));
+    cleanup(path);
 }

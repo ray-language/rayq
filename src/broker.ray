@@ -92,26 +92,15 @@ fn load_queue(dir: string, name: string) -> Result<Entry, string> {
             bodies.remove(r.id);
             attempts.remove(r.id);
         } else if (r.op == "nack") {
-            match (get(attempts, r.id)) {
-                Option.Some(n) => {
-                    attempts.insert(r.id, n + 1);
-                },
-                Option.None => { },
+            if let Option.Some(n) = attempts.get(r.id) {
+                attempts.insert(r.id, n + 1);
             }
         }
     }
     // ids come out of a Map (sorted by key): uuid_v7 ids are time-ordered, so
     // FIFO order survives the round trip through the Map.
-    for id in bodies.keys() {
-        let body = match (get(bodies, id)) {
-            Option.Some(s) => s,
-            Option.None => "",
-        };
-        let attempt = match (get(attempts, id)) {
-            Option.Some(n) => n,
-            Option.None => 0,
-        };
-        queue.enqueue(state, id, body, attempt);
+    for (id, body) in bodies {
+        queue.enqueue(state, id, body, attempts.get_or(id, 0));
     }
     var pend: [wal.Record] = [];
     for m in queue.pending(state) {
@@ -180,7 +169,7 @@ fn do_pull(b: Broker, name: string) -> Json {
     match (entry_of(b, name)) {
         Result.Err(e) => jerr(e),
         Result.Ok(en) => {
-            match (queue.pull_one(en.state, b.tuning, time.monotonic())) {
+            match (queue.pull_one(en.state, b.tuning, time.monotonic_millis())) {
                 Option.Some(m) => {
                     var out: Map<string, Json> = Map.new();
                     out.insert("id", Json.JStr(m.id));
@@ -237,11 +226,8 @@ fn to_dlq(b: Broker, name: string, m: queue.Msg) {
         },
         Result.Err(e) => { },
     }
-    match (get(b.queues, name)) {
-        Option.Some(en) => {
-            wal.append(en.log, wal.ack_record(m.id));
-        },
-        Option.None => { },
+    if let Option.Some(en) = b.queues.get(name) {
+        wal.append(en.log, wal.ack_record(m.id));
     }
 }
 
@@ -249,7 +235,7 @@ fn do_nack(b: Broker, name: string, id: string) -> Json {
     match (entry_of(b, name)) {
         Result.Err(e) => jerr(e),
         Result.Ok(en) => {
-            match (queue.nack_one(en.state, b.tuning, id, time.monotonic())) {
+            match (queue.nack_one(en.state, b.tuning, id, time.monotonic_millis())) {
                 queue.NackResult.Scheduled(wait) => {
                     wal.append(en.log, wal.nack_record(id));
                     var m: Map<string, Json> = Map.new();
@@ -297,16 +283,13 @@ fn stats_one(b: Broker, name: string) -> Json {
 }
 
 fn do_tick(b: Broker) {
-    let now = time.monotonic();
+    let now = time.monotonic_millis();
+    // Snapshot the names: to_dlq may create `<name>.dlq` entries mid-loop.
     for name in b.queues.keys() {
-        match (get(b.queues, name)) {
-            Option.Some(en) => {
-                let dead = queue.tick(en.state, b.tuning, now);
-                for m in dead {
-                    to_dlq(b, name, m);
-                }
-            },
-            Option.None => { },
+        if let Option.Some(en) = b.queues.get(name) {
+            for m in queue.tick(en.state, b.tuning, now) {
+                to_dlq(b, name, m);
+            }
         }
     }
 }
@@ -320,11 +303,10 @@ pub fn stop(ch: Channel<Bk>) {
 }
 
 fn actor_loop(ch: Channel<Bk>, b: Broker) {
-    var running = true;
-    while (running) {
+    while (true) {
         match (recv(ch)) {
             Option.None => {
-                running = false;
+                break;
             },
             Option.Some(msg) => {
                 match (msg) {
@@ -344,16 +326,13 @@ fn actor_loop(ch: Channel<Bk>, b: Broker) {
                         send(reply, do_stats(b, q));
                     },
                     Bk.Stop(done) => {
-                        for name in b.queues.keys() {
-                            match (get(b.queues, name)) {
-                                Option.Some(entry) => wal.close_wal(entry.log),
-                                Option.None => { },
-                            }
+                        for (name, entry) in b.queues {
+                            wal.close_wal(entry.log);
                         }
                         let _ = fs.unlock(b.lock_h);
                         close(b.lock_h);
                         send(done, 1);
-                        running = false;
+                        break;
                     },
                     Bk.Tick => {
                         do_tick(b);

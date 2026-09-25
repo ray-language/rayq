@@ -134,17 +134,34 @@ pub fn replay(path: string) -> Replayed {
 // Rewrites the log to just the surviving pushes (with their attempt counts)
 // and atomically renames it over the old one. The open append handle points
 // at the OLD inode, so the caller must reopen: compact returns the fresh Wal.
+//
+// The temp file is fsync'd BEFORE the rename: otherwise a power loss right
+// after the (atomic) rename can leave the queue's only log empty or partial.
 pub fn compact(w: Wal, pending: [Record]) -> Result<Wal, string> {
     let tmp = w.path + ".tmp";
     var content = "";
     for r in pending {
         content = content + encode(r) + "\n";
     }
-    fs.write_file(tmp, content)?;
+    write_synced(tmp, content)?;
     close(w.handle);
     fs.rename(tmp, w.path)?;
     let h = fs.open(w.path, "a")?;
     Result.Ok(Wal { path: w.path, handle: h, records: pending.len(), acked_since_compact: 0 })
+}
+
+// write_file + fsync, closing the handle on every path.
+fn write_synced(path: string, content: string) -> Result<int, string> {
+    let h = fs.open(path, "w")?;
+    let r = write_then_sync(h, content);
+    close(h);
+    r
+}
+
+fn write_then_sync(h: int, content: string) -> Result<int, string> {
+    let n = fs.write(h, content)?;
+    fs.sync(h)?;
+    Result.Ok(n)
 }
 
 pub fn push_record(id: string, body: string, attempt: int) -> Record {

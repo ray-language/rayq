@@ -39,7 +39,8 @@ descarta y se reporta — probado con `kill -9` a mitad de trabajo: los mensajes
 in-flight vuelven a `ready`, los ackeados no reaparecen. La **compactación**
 (al arrancar y cada 1000 acks) reescribe el log solo con lo pendiente y lo
 renombra encima (`fs.rename` atómico), reabriendo el handle (el viejo apunta
-al inode antiguo).
+al inode antiguo). El temporal pasa por `fs.sync` **antes** del rename: sin
+eso, un corte de luz justo después podía dejar la cola con un log vacío.
 
 **Durabilidad y exclusión (resueltas en raylang M115)**: cada append pasa por
 `fs.sync` (durable ante corte de luz, no solo ante crash del proceso), y el
@@ -61,9 +62,12 @@ default es 7450; RPC = frames con prefijo de longitud + JSON (`packages/rpc`).
 
 ## Rendimiento (sanity check)
 
-Cliente único secuencial, misma máquina, broker nativo: **~6.8k push/s** y
-~3.6k pull+ack/s (2 RPC por mensaje → ~7.3k RPC/s); broker en VM: ~4.2k / ~2.5k.
-Cada push es un append a disco con `fs.sync` (durable de verdad).
+Cliente único secuencial, misma máquina (Apple Silicon, APFS), broker nativo,
+re-medido con raylang 1.27.11: **~206 push/s** y ~197 pull+ack/s. El techo es
+el `fs.sync` por registro (~5 ms en macOS, que fuerza el volcado real a disco):
+cada push y cada ack esperan a su fsync, y el actor los serializa. Las cifras
+antiguas (~6.8k push/s) eran de antes de añadir el fsync. Agrupar los fsync
+(group commit: varios registros, un sync) es el paso natural — ver v2.
 
 ## Estado actual
 
@@ -78,9 +82,11 @@ Cada push es un append a disco con `fs.sync` (durable de verdad).
 | Apagado graceful (SIGTERM/SIGINT vía rpc.serve_graceful) | ✅ |
 | Binario nativo (broker y cliente; E2E verificado) | ✅ |
 | Tests (WAL, máquina de estados con tiempo manual, E2E con reinicio) | ✅ 10 |
+| Compactación durable (fsync del temporal antes del rename) | ✅ |
 | fsync / durabilidad ante corte de luz | ✅ (raylang M115.1: `fs.sync` por append) |
 | File locks (dos brokers, mismo dir) | ✅ (raylang M115.2: flock sobre `LOCK`) |
 | Long-poll servidor (`pull --wait` sondea del lado cliente) | 📋 v2 |
+| Group commit (un fsync para varios registros) | 📋 v2 |
 
 ## Hallazgos de dogfood (necesidades confirmadas del lenguaje)
 
@@ -100,6 +106,9 @@ Anotados en `raylang/IDEAS.md` §66:
    reconstruye la cola en orden FIFO gratis.
 
 ## Desarrollo
+
+Requiere raylang ≥ 1.27; la dependencia `rpc` viene del índice de paquetes
+(`rpc = "^0.1.0"` en `ray.toml`, versión exacta fijada en `ray.lock`).
 
 ```sh
 ray test                      # 10 tests
