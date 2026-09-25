@@ -43,25 +43,13 @@ fn encode(r: Record) -> string {
 fn decode(line: string) -> Option<Record> {
     match (json.parse(line)) {
         Result.Ok(j) => {
-            let op = match (json.get_string(j, "op")) {
-                Option.Some(s) => s,
-                Option.None => "",
-            };
-            let id = match (json.get_string(j, "id")) {
-                Option.Some(s) => s,
-                Option.None => "",
-            };
+            let op = json.get_string(j, "op").unwrap_or("");
+            let id = json.get_string(j, "id").unwrap_or("");
             if (op == "" || id == "") {
                 return Option.None;
             }
-            let body = match (json.get_string(j, "body")) {
-                Option.Some(s) => s,
-                Option.None => "",
-            };
-            let attempt = match (json.get_int(j, "attempt")) {
-                Option.Some(n) => n,
-                Option.None => 0,
-            };
+            let body = json.get_string(j, "body").unwrap_or("");
+            let attempt = json.get_int(j, "attempt").unwrap_or(0);
             Option.Some(Record { op: op, id: id, body: body, attempt: attempt })
         },
         Result.Err(e) => Option.None,

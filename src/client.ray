@@ -63,18 +63,9 @@ pub fn pull(host: string, port: int, q: string, wait_ms: int, auto_ack: bool) ->
                 },
                 Result.Ok(j) => {
                     if (!json.is_null(j)) {
-                        let id = match (json.get_string(j, "id")) {
-                            Option.Some(s) => s,
-                            Option.None => "",
-                        };
-                        let body = match (json.get_string(j, "body")) {
-                            Option.Some(s) => s,
-                            Option.None => "",
-                        };
-                        let attempt = match (json.get_int(j, "attempt")) {
-                            Option.Some(n) => n,
-                            Option.None => 0,
-                        };
+                        let id = json.get_string(j, "id").unwrap_or("");
+                        let body = json.get_string(j, "body").unwrap_or("");
+                        let attempt = json.get_int(j, "attempt").unwrap_or(0);
                         print(id + "\t" + to_string(attempt) + "\t" + body);
                         if (auto_ack) {
                             rpc.call(c, "ack", params2("queue", q, "id", id));
@@ -149,14 +140,8 @@ pub fn worker(host: string, port: int, q: string, argv: [string]) -> int {
                     if (json.is_null(j)) {
                         time.sleep(300);
                     } else {
-                        let id = match (json.get_string(j, "id")) {
-                            Option.Some(s) => s,
-                            Option.None => "",
-                        };
-                        let body = match (json.get_string(j, "body")) {
-                            Option.Some(s) => s,
-                            Option.None => "",
-                        };
+                        let id = json.get_string(j, "id").unwrap_or("");
+                        let body = json.get_string(j, "body").unwrap_or("");
                         var rest: [string] = [];
                         var i = 1;
                         while (i < argv.len()) {

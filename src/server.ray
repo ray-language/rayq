@@ -57,10 +57,7 @@ pub fn handle(bk: Channel<broker.Bk>, req: rpc.Req) -> Result<Json, string> {
             broker.Bk.Nack(q, id, reply)
         }))
     } else if (req.method == "stats") {
-        let q = match (json.get_string(req.params, "queue")) {
-            Option.Some(s) => s,
-            Option.None => "",
-        };
+        let q = json.get_string(req.params, "queue").unwrap_or("");
         reply_or_err(broker.ask(bk, fn(reply: Channel<Json>) -> broker.Bk {
             broker.Bk.Stats(q, reply)
         }))
