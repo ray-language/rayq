@@ -30,7 +30,13 @@ fn main() -> int {
     }
     var ms = time.monotonic() - t0;
     print(
-        "push: " + to_string(N) + " in " + to_string(ms) + " ms = " + to_string(N * 1000 / ms) + " msg/s"
+        "push: "
+            + to_string(N)
+            + " in "
+            + to_string(ms)
+            + " ms = "
+            + to_string(N * 1000 / ms)
+            + " msg/s"
     );
     t0 = time.monotonic();
     var drained = 0;
@@ -59,7 +65,13 @@ fn main() -> int {
     }
     ms = time.monotonic() - t0;
     print(
-        "pull+ack: " + to_string(drained) + " in " + to_string(ms) + " ms = " + to_string(drained * 1000 / ms) + " msg/s"
+        "pull+ack: "
+            + to_string(drained)
+            + " in "
+            + to_string(ms)
+            + " ms = "
+            + to_string(drained * 1000 / ms)
+            + " msg/s"
     );
     rpc.disconnect(c);
     0

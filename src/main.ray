@@ -18,7 +18,9 @@ fn usage() {
     eprint("  rayq worker QUEUE -- CMD [ARGS...]   (body on stdin; exit 0 = ack)");
     eprint("");
     eprint(
-        "  defaults: dir ./rayq-data, port " + to_string(DEFAULT_PORT) + ", visibility 30000 ms, max attempts 5"
+        "  defaults: dir ./rayq-data, port "
+            + to_string(DEFAULT_PORT)
+            + ", visibility 30000 ms, max attempts 5"
     );
 }
 
@@ -119,11 +121,11 @@ fn main() -> int {
             },
             Result.Ok(bk) => {
                 match (server.run(
-                flag_str(av, "--bind", "0.0.0.0"),
-                port,
-                bk,
-                flag_int(av, "--drain", 3000)
-            )) {
+                    flag_str(av, "--bind", "0.0.0.0"),
+                    port,
+                    bk,
+                    flag_int(av, "--drain", 3000)
+                )) {
                     Result.Ok(code) => code,
                     Result.Err(e) => {
                         eprint("rayq: " + e);
