@@ -5,15 +5,12 @@
 import std/fs;
 import std/time;
 import std/json;
+import std/net;
 from std/json import Json;
 import rpc/rpc;
 import queue;
 import broker;
 import server;
-
-const PORT_A: int = 18951;
-
-const PORT_B: int = 18952;
 
 fn tuning() -> queue.Tuning {
     queue.Tuning {
@@ -24,16 +21,21 @@ fn tuning() -> queue.Tuning {
     }
 }
 
-fn boot(dir: string, port: int) -> Channel<broker.Bk> {
+// Boots a broker over dir plus an RPC server on an ephemeral port; returns
+// the broker and the port.
+fn boot(dir: string) -> (Channel<broker.Bk>, int) {
     let bk = match (broker.start(dir, tuning())) {
         Result.Ok(b) => b,
         Result.Err(e) => panic(e),
     };
+    let listener = match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Ok(l) => l,
+        Result.Err(e) => panic(e),
+    };
     spawn(fn() {
-        server.run("127.0.0.1", port, bk, 0);
+        server.serve_on(listener, bk);
     });
-    time.sleep(150);
-    bk
+    (bk, net.local_port(listener))
 }
 
 fn connect(port: int) -> rpc.Client {
@@ -78,8 +80,8 @@ fn broker_end_to_end() {
         Result.Ok(d) => d,
         Result.Err(e) => panic(e),
     };
-    let bk = boot(dir, PORT_A);
-    let c = connect(PORT_A);
+    let (bk, port) = boot(dir);
+    let c = connect(port);
 
     // push/pull/ack round trip.
     let id1 = str_of(call_ok(c, "push", params([("queue", "jobs"), ("body", "uno")])), "id");
@@ -135,8 +137,8 @@ fn broker_end_to_end() {
     // Apagado ordenado del primer broker: suelta el candado del dir (M115.2) — sin esto el
     // segundo boot EN el mismo proceso choca con el flock (que no muere con la fibra).
     broker.stop(bk);
-    boot(dir, PORT_B);
-    let c2 = connect(PORT_B);
+    let (bk2, port2) = boot(dir);
+    let c2 = connect(port2);
     let s1 = call_ok(c2, "pull", params([("queue", "jobs")]));
     assert_eq(str_of(s1, "id"), id4);
     assert_eq(str_of(s1, "body"), "cuatro");
@@ -145,5 +147,6 @@ fn broker_end_to_end() {
     let s2 = call_ok(c2, "pull", params([("queue", "jobs.dlq")]));
     assert_eq(str_of(s2, "id"), id2);
     rpc.disconnect(c2);
+    broker.stop(bk2);
     fs.remove_all(dir);
 }

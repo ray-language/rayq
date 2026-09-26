@@ -165,20 +165,8 @@ pub fn depths(q: QueueState) -> Depths {
 // Everything still owed to consumers (for WAL compaction): ready + in-flight +
 // delayed, each with its current attempt count.
 pub fn pending(q: QueueState) -> [Msg] {
-    var out: [Msg] = [];
-    // Deque has no indexed peek: rotate through it (len pops + pushes).
-    var i = 0;
-    let n = q.ready.len();
-    while (i < n) {
-        match (q.ready.pop_front()) {
-            Option.Some(m) => {
-                out.push(m);
-                q.ready.push_back(m);
-            },
-            Option.None => { },
-        }
-        i = i + 1;
-    }
+    // deque.to_array (raylang 1.27.13): a front-to-back snapshot, no rotation.
+    var out: [Msg] = q.ready.to_array();
     for (id, inf) in q.inflight {
         out.push(inf.msg);
     }
