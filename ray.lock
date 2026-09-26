@@ -3,6 +3,6 @@
 
 [rpc]
 url = "https://github.com/ray-language/rpc"
-ref = "v0.1.0"
-commit = "5d84b61491715531a8fcdce2832b91c105e3d900"
-hash = "sha256:3d6e69ea71cf4e4a4930337e20bf41438e208f40d7e1edf4200348b17c1fe049"
+ref = "v0.1.2"
+commit = "84098c01ec284eebf05418fc97b1c15540aff6bb"
+hash = "sha256:1b4fc1381c92be81a2e04d0b42a311d2bf86f626a372f8167a67864008c3253f"

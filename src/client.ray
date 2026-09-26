@@ -80,7 +80,6 @@ pub fn pull(host: string, port: int, q: string, wait_ms: int, auto_ack: bool) ->
                 },
             }
         }
-        0
     })
 }
 
@@ -163,6 +162,5 @@ pub fn worker(host: string, port: int, q: string, argv: [string]) -> int {
                 },
             }
         }
-        0
     })
 }

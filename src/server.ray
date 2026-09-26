@@ -72,3 +72,12 @@ pub fn run(bind: string, port: int, bk: Channel<broker.Bk>, drain_ms: int) -> Re
         handle(bk, req)
     })
 }
+
+// Serves on a listener the caller already opened (rpc.serve_on, rpc 0.1.1+):
+// `net.tcp_listen(host, 0)` + `net.local_port` gives tests an ephemeral port
+// with no close/re-bind race. Blocks forever.
+pub fn serve_on(listener: int, bk: Channel<broker.Bk>) -> Result<int, string> {
+    rpc.serve_on(listener, fn(req: rpc.Req) -> Result<Json, string> {
+        handle(bk, req)
+    })
+}
