@@ -42,8 +42,10 @@ renombra encima (`fs.rename` atómico), reabriendo el handle (el viejo apunta
 al inode antiguo). El temporal pasa por `fs.sync` **antes** del rename: sin
 eso, un corte de luz justo después podía dejar la cola con un log vacío.
 
-**Durabilidad y exclusión (resueltas en raylang M115)**: cada append pasa por
-`fs.sync` (durable ante corte de luz, no solo ante crash del proceso), y el
+**Durabilidad y exclusión**: cada append pasa por `fs.sync_data` (fdatasync,
+raylang 1.27.21): sobrevive a un crash del proceso o del SO, pero en APFS no
+vacía la caché del disco, así que un corte de luz puede perder los últimos
+registros; la compactación es el checkpoint con `fs.sync` completo. Y el
 broker toma un `flock` consultivo sobre `<dir>/LOCK` al arrancar — un segundo
 broker sobre el mismo dir falla con un error claro en vez de corromper.
 
@@ -63,11 +65,10 @@ default es 7450; RPC = frames con prefijo de longitud + JSON (`packages/rpc`).
 ## Rendimiento (sanity check)
 
 Cliente único secuencial, misma máquina (Apple Silicon, APFS), broker nativo,
-re-medido con raylang 1.27.11: **~206 push/s** y ~197 pull+ack/s. El techo es
-el `fs.sync` por registro (~5 ms en macOS, que fuerza el volcado real a disco):
-cada push y cada ack esperan a su fsync, y el actor los serializa. Las cifras
-antiguas (~6.8k push/s) eran de antes de añadir el fsync. Agrupar los fsync
-(group commit: varios registros, un sync) es el paso natural — ver v2.
+raylang 1.27.21: **~10–11k push/s** con `fs.sync_data` por registro. Con
+`fs.sync` (un `F_FULLFSYNC` de ~5 ms en macOS que el actor serializa) eran
+~206 push/s y ~197 pull+ack/s (1.27.11). Agrupar los volcados (group commit:
+varios registros, un sync) sigue siendo el paso natural — ver v2.
 
 ## Estado actual
 
@@ -83,7 +84,7 @@ antiguas (~6.8k push/s) eran de antes de añadir el fsync. Agrupar los fsync
 | Binario nativo (broker y cliente; E2E verificado) | ✅ |
 | Tests (WAL, máquina de estados con tiempo manual, E2E con reinicio) | ✅ 10 |
 | Compactación durable (fsync del temporal antes del rename) | ✅ |
-| fsync / durabilidad ante corte de luz | ✅ (raylang M115.1: `fs.sync` por append) |
+| Volcado por registro (`fs.sync_data`; `fs.sync` al compactar) | ✅ (raylang 1.27.21) |
 | File locks (dos brokers, mismo dir) | ✅ (raylang M115.2: flock sobre `LOCK`) |
 | Long-poll servidor (`pull --wait` sondea del lado cliente) | 📋 v2 |
 | Group commit (un fsync para varios registros) | 📋 v2 |
@@ -93,7 +94,8 @@ antiguas (~6.8k push/s) eran de antes de añadir el fsync. Agrupar los fsync
 Anotados en `raylang/IDEAS.md` §66:
 
 1. **[RESUELTO — raylang M115.1]** `std/fs` no tiene `fsync`/flush: `fs.sync`
-   existe y el WAL lo llama por append.
+   existe. **[RESUELTO — raylang 1.27.21]** `fs.sync_data` ya es barato en APFS
+   (~10k push/s frente a ~206): el WAL lo llama por append.
 2. **[RESUELTO — raylang M115.2]** No hay file locks: `fs.try_lock` existe y
    el broker candea `<dir>/LOCK` (con `broker.stop` para soltarlo ordenado).
 3. `fs.rename` SÍ existe y funciona como reemplazo atómico (la compactación
@@ -107,7 +109,7 @@ Anotados en `raylang/IDEAS.md` §66:
 
 ## Desarrollo
 
-Requiere raylang ≥ 1.27; la dependencia `rpc` viene del índice de paquetes
+Requiere raylang ≥ 1.27.21; la dependencia `rpc` viene del índice de paquetes
 (`rpc = "^0.1.0"` en `ray.toml`, versión exacta fijada en `ray.lock`).
 
 ```sh
