@@ -6,9 +6,10 @@
 // without a trailing newline or that fails to parse — that torn tail is the
 // whole recovery story.
 //
-// DURABILITY (resolved finding): fs.sync exists since raylang M115.1, so
-// every append is fsync'd — durable across power loss, not just a process
-// crash. The cost is one fsync per record; batch-ack workloads amortize it.
+// DURABILITY: every append is flushed with fs.sync_data (fdatasync) — it
+// survives a process or OS crash; on macOS/APFS it skips the drive-cache
+// flush, so a power cut can lose the last records. Compaction is the
+// checkpoint: its temp file goes through a full fs.sync before the rename.
 import std/fs;
 import std/json;
 from std/json import Json;
@@ -63,8 +64,8 @@ pub fn open_wal(path: string) -> Result<Wal, string> {
 
 pub fn append(w: Wal, r: Record) -> Result<int, string> {
     let n = fs.write(w.handle, encode(r) + "\n")?;
-    // fs.sync (raylang M115.1): el append llega al DISCO, no solo al page cache.
-    fs.sync(w.handle)?;
+    // sync_data per record: fs.sync here capped the broker at ~200 records/s.
+    fs.sync_data(w.handle)?;
     w.records = w.records + 1;
     if (r.op == "ack") {
         w.acked_since_compact = w.acked_since_compact + 1;
