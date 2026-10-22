@@ -1,0 +1,24 @@
+// Queue names become file names: only plain ones are accepted.
+import broker;
+
+@test
+fn queue_names_cannot_name_a_path() {
+    assert_eq(broker.valid_name("jobs"), true);
+    assert_eq(broker.valid_name("jobs.dlq"), true);
+    assert_eq(broker.valid_name("a-b_c.1"), true);
+    assert_eq(broker.valid_name("q".repeat(124) + ".dlq"), true);
+    for bad in [
+        "",
+        ".",
+        "..",
+        ".hidden",
+        "../x",
+        "a/b",
+        "/etc/x",
+        "a\\b",
+        "x\0y",
+        "q".repeat(125)
+    ] {
+        assert_eq_msg(broker.valid_name(bad), false, bad);
+    }
+}

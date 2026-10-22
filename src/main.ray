@@ -20,7 +20,7 @@ fn usage() {
     eprint(
         "  defaults: dir ./rayq-data, port "
             + to_string(DEFAULT_PORT)
-            + ", visibility 30000 ms, max attempts 5"
+            + " on 127.0.0.1, visibility 30000 ms, max attempts 5"
     );
 }
 
@@ -104,7 +104,7 @@ fn main() -> int {
             },
             Result.Ok(bk) => {
                 match (server.run(
-                    flag_str(av, "--bind", "0.0.0.0"),
+                    flag_str(av, "--bind", "127.0.0.1"),
                     port,
                     bk,
                     flag_int(av, "--drain", 3000)
