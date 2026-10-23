@@ -126,7 +126,37 @@ fn load(dir: string, tuning: queue.Tuning, lock_h: int) -> Result<Broker, string
     Result.Ok(Broker { dir: dir, tuning: tuning, queues: queues, torn_total: torn, lock_h: lock_h })
 }
 
+// The longest queue name a client can use: its dead-letter queue
+// `<name>.dlq` must stay valid too, or nack would drop spent messages.
+const MAX_NAME: int = 124;
+
+/// Whether `name` can be a queue: 1 to 124 of [A-Za-z0-9._-] (plus its
+/// ".dlq"), not starting with a dot. The name becomes `<dir>/<name>.log`, so
+/// anything else (a slash, "..", a NUL) could reach files outside the data
+/// directory.
+pub fn valid_name(name: string) -> bool {
+    let base = if (name.ends_with(".dlq")) { name.substring(0, name.len() - 4) } else { name };
+    if (base.len() == 0 || base.len() > MAX_NAME || name.starts_with(".")) {
+        return false;
+    }
+    for c in name.to_bytes() {
+        let ok = c >= 97 && c <= 122
+            || c >= 65 && c <= 90
+            || c >= 48 && c <= 57
+            || c == 46
+            || c == 95
+            || c == 45;
+        if (!ok) {
+            return false;
+        }
+    }
+    true
+}
+
 fn entry_of(b: Broker, name: string) -> Result<Entry, string> {
+    if (!valid_name(name)) {
+        return Result.Err("invalid queue name (1-124 of A-Z a-z 0-9 . _ -, not starting with '.')");
+    }
     match (get(b.queues, name)) {
         Option.Some(e) => Result.Ok(e),
         Option.None => {

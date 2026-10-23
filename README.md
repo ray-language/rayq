@@ -62,6 +62,15 @@ rayq worker QUEUE -- CMD [ARGS...]
 el mensaje se perdió — para trabajo real usa `worker` o ack manual). El puerto
 default es 7450; RPC = frames con prefijo de longitud + JSON (`packages/rpc`).
 
+**Exposición**: el broker no autentica, así que por defecto escucha solo en
+`127.0.0.1`; `--bind 0.0.0.0` lo abre a la red y queda en tus manos ponerlo
+detrás de algo que filtre. Los nombres de cola se convierten en
+`<dir>/<cola>.log`: solo se aceptan 1–124 caracteres de `A-Z a-z 0-9 . _ -`
+que no empiecen por punto (más el `.dlq` de la cola muerta), así que ningún
+nombre sale del directorio de datos. Una conexión que deja un frame a medias
+ocupa su fibra hasta que el cliente cierra: `packages/rpc` no pone timeout de
+lectura en el servidor.
+
 ## Rendimiento (sanity check)
 
 Cliente único secuencial, misma máquina (Apple Silicon, APFS), broker nativo,
